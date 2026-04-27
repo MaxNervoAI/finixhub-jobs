@@ -1,0 +1,41 @@
+name: YOUR WORKFLOW NAME
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # Edit schedule
+  workflow_dispatch:        # Always include for manual triggers
+
+# Minimum permissions — never grant more than needed
+permissions:
+  contents: read
+
+# Prevent concurrent runs of the same workflow
+# Set cancel-in-progress: false for jobs that MUST NOT be interrupted (e.g. db-backup, backfill)
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30    # REQUIRED — prevents runaway jobs hitting 6h ceiling
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Run script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Add AI keys only if this script calls an AI API:
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+        run: npx tsx scripts/your-script.ts

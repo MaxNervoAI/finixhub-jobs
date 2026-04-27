@@ -1,3 +1,11 @@
+# Environment — NEVER commit secrets
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+
 # Logs
 logs
 *.log
