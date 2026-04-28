@@ -1,0 +1,68 @@
+name: Backfill Historical Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: 'Start date (YYYY-MM-DD)'
+        required: true
+        type: string
+      to_date:
+        description: 'End date (YYYY-MM-DD, defaults to today)'
+        required: false
+        type: string
+        default: ''
+      symbols:
+        description: 'Comma-separated symbols to target (default: all active)'
+        required: false
+        type: string
+        default: ''
+      skip_insights:
+        description: 'Skip AI insights generation'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run backfill
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          ARGS="--from ${{ inputs.from_date }}"
+          if [ -n "${{ inputs.to_date }}" ]; then
+            ARGS="$ARGS --to ${{ inputs.to_date }}"
+          fi
+          if [ -n "${{ inputs.symbols }}" ]; then
+            ARGS="$ARGS --symbols ${{ inputs.symbols }}"
+          fi
+          if [ "${{ inputs.skip_insights }}" = "true" ]; then
+            ARGS="$ARGS --skip-insights"
+          fi
+          npx tsx scripts/backfill.ts $ARGS
