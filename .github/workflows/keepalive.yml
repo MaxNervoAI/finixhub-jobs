@@ -1,0 +1,24 @@
+name: Keepalive
+
+on:
+  schedule:
+    # First day of every month at 06:00 UTC
+    # Prevents GitHub from disabling scheduled workflows after 60 days of repo inactivity
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping
+        run: echo "Keepalive ping — $(date -u). Prevents GitHub from disabling scheduled workflows after 60 days of inactivity."

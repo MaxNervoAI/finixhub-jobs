@@ -2,15 +2,19 @@ name: YOUR WORKFLOW NAME
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # Edit schedule
+    - cron: '0 0 * * *'   # Edit schedule — crontab.guru to verify
   workflow_dispatch:        # Always include for manual triggers
+  # NEVER add: pull_request, push, fork — public repo, forks would get free CI
 
-# Minimum permissions — never grant more than needed
+# ── Safety Defaults ──────────────────────────────────────────────────────────
+# Minimum permissions: never grant more than needed.
+# contents: write only if this job commits back to THIS repo (e.g. update-live-demo).
 permissions:
   contents: read
 
-# Prevent concurrent runs of the same workflow
-# Set cancel-in-progress: false for jobs that MUST NOT be interrupted (e.g. db-backup, backfill)
+# Prevent concurrent runs of the same workflow.
+# IMPORTANT: set cancel-in-progress: false for jobs that must not be interrupted
+# mid-execution (db-backup, backfill). For all others, true is correct.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
@@ -18,7 +22,9 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30    # REQUIRED — prevents runaway jobs hitting 6h ceiling
+    # REQUIRED: prevents runaway jobs consuming all runner time and hitting 6h ceiling.
+    # Use 350 for backfill (5h 50m). Use 10-30 for most jobs.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4

@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Global allowlist"
+regexes = [
+  # .env.example contains placeholder values only — not real secrets
+  '''your-service-role-key''',
+  '''your-project-ref''',
+  '''github_pat_\.\.\.$''',
+]
+paths = [
+  ".env.example",
+]
