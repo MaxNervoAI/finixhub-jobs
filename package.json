@@ -1,0 +1,36 @@
+{
+  "name": "finixhub-jobs",
+  "version": "1.0.0",
+  "description": "Scheduled data pipeline jobs for FinixHub (runs on GitHub Actions public repo for free unlimited minutes)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "calc-indicators": "tsx scripts/calculate-technical-indicators.ts",
+    "sync-assets": "tsx scripts/sync-active-assets.ts",
+    "sync-ohlcv": "tsx scripts/sync-binance-ohlcv.ts",
+    "fetch-metrics": "tsx scripts/fetch-asset-metrics.ts",
+    "fetch-fear-greed": "tsx scripts/fetch-fear-greed.ts",
+    "generate-insights": "tsx scripts/generate-daily-insights.ts",
+    "price-summary": "tsx scripts/generate-price-movement-summary.ts",
+    "backfill": "tsx scripts/backfill.ts",
+    "validate": "tsx scripts/validate-market-data.ts",
+    "scraper": "node scripts/news-scraper/scraper.js"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "@supabase/supabase-js": "^2.103.3",
+    "dotenv": "^16.4.5",
+    "jsdom": "^27.0.1",
+    "rss-parser": "^3.13.0",
+    "sentiment": "^5.0.2"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
