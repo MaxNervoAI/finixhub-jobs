@@ -1,0 +1,54 @@
+name: Price Movement Summary
+
+on:
+  schedule:
+    # Morning summary at 08:00 UTC, afternoon at 16:00 UTC
+    - cron: '0 8 * * *'
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: 'Snapshot time (morning or afternoon)'
+        required: false
+        default: 'morning'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: price-movement-summary
+  cancel-in-progress: false
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Generate Price Movement Summary
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+        run: |
+          # Determine snapshot time
+          HOUR=$(date -u +%H)
+          if [ -n "${{ github.event.inputs.snapshot }}" ]; then
+            SNAP="${{ github.event.inputs.snapshot }}"
+          elif [ "$HOUR" -lt 12 ]; then
+            SNAP="morning"
+          else
+            SNAP="afternoon"
+          fi
+          echo "Running $SNAP summary"
+          npx tsx scripts/generate-price-movement-summary.ts --snapshot "$SNAP"
