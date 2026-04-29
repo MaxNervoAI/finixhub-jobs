@@ -1,9 +1,4 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { createClient } from '@supabase/supabase-js';
 
 async function getAssetsData() {
     const assets = ['BTC', 'ETH', 'SOL'];
@@ -87,16 +82,25 @@ async function getAssetsData() {
         }
     }
 
-    const outDir = path.join(__dirname, '../src/data');
-    if (!fs.existsSync(outDir)) {
-        fs.mkdirSync(outDir, { recursive: true });
+    const supabase = createClient(
+        process.env.SUPABASE_URL,
+        process.env.SUPABASE_SERVICE_ROLE_KEY
+    );
+
+    const { error } = await supabase.storage
+        .from('demo-plans')
+        .upload('active.json', JSON.stringify(plans), {
+            contentType: 'application/json',
+            upsert: true
+        });
+
+    if (error) {
+        console.error('Failed to upload demo plans to Supabase Storage:', error);
+        process.exit(1);
     }
 
-    fs.writeFileSync(
-        path.join(outDir, 'demoActivePlans.json'),
-        JSON.stringify(plans, null, 2)
-    );
-    console.log(`Generated ${plans.length} demo active plans.`);
+    console.log(`Generated ${plans.length} demo active plans and uploaded to Supabase Storage.`);
+    process.exit(0);
 }
 
 getAssetsData();
