@@ -1,0 +1,205 @@
+name: Daily DB Backup
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # 03:00 UTC every day
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you running an on-demand backup?'
+        required: false
+        default: 'manual'
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    name: Dump Postgres & push to backup repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Postgres major version used by Supabase (17 at time of writing).
+      PG_MAJOR: '17'
+      BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+      BACKUP_REPO_TOKEN: ${{ secrets.BACKUP_REPO_TOKEN }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      RETAIN_DAILY: '30'
+      RETAIN_MONTHLY: '12'
+
+    steps:
+      - name: Validate secrets
+        run: |
+          missing=0
+          for v in SUPABASE_DB_URL BACKUP_REPO BACKUP_REPO_TOKEN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing secret: $v"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "Set these in repo Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Checkout source repo (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set timestamp vars
+        id: ts
+        run: |
+          NOW_UTC=$(date -u +%Y%m%dT%H%M%SZ)
+          DAY_PATH=$(date -u +%Y/%m/%d)
+          YEAR_MONTH=$(date -u +%Y-%m)
+          DAY_OF_MONTH=$(date -u +%d)
+          echo "now=$NOW_UTC" >> "$GITHUB_OUTPUT"
+          echo "day_path=$DAY_PATH" >> "$GITHUB_OUTPUT"
+          echo "year_month=$YEAR_MONTH" >> "$GITHUB_OUTPUT"
+          echo "day_of_month=$DAY_OF_MONTH" >> "$GITHUB_OUTPUT"
+
+      - name: Create dumps
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          NOW="${{ steps.ts.outputs.now }}"
+          echo "Creating custom-format dump..."
+          docker run --rm \
+            postgres:${PG_MAJOR} \
+            pg_dump "$SUPABASE_DB_URL" \
+            --format=custom \
+            --compress=9 \
+            --no-owner \
+            --no-privileges \
+            > "out/backup-${NOW}.dump"
+          echo "Creating plain SQL dump (gzipped)..."
+          docker run --rm \
+            postgres:${PG_MAJOR} \
+            pg_dump "$SUPABASE_DB_URL" \
+            --format=plain \
+            --no-owner \
+            --no-privileges \
+            | gzip -9 > "out/backup-${NOW}.sql.gz"
+          ls -la out
+
+      - name: Collect row counts + schema SHA (manifest inputs)
+        id: manifest
+        run: |
+          set -euo pipefail
+          # Row counts per user table (public schema) via pg_class for speed, then
+          # precise counts per table for correctness.
+          docker run --rm \
+            postgres:${PG_MAJOR} \
+            psql "$SUPABASE_DB_URL" -Atc "
+            select json_agg(row_to_json(t))
+            from (
+              select schemaname, relname as table_name, n_live_tup as row_count
+              from pg_stat_user_tables
+              order by schemaname, relname
+            ) t;
+          " > row_counts.json
+          PG_VERSION=$(docker run --rm postgres:${PG_MAJOR} psql "$SUPABASE_DB_URL" -Atc "select version();")
+          echo "pg_version=$PG_VERSION" >> "$GITHUB_OUTPUT"
+          # Compute migrations SHA if migrations directory exists (may not in public repo)
+          if [ -d supabase/migrations ]; then
+            MIGRATIONS_SHA=$(find supabase/migrations -type f -name '*.sql' -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+            echo "migrations_sha=$MIGRATIONS_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "migrations_sha=(no-migrations-dir)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write manifest.json
+        run: |
+          set -euo pipefail
+          NOW="${{ steps.ts.outputs.now }}"
+          DUMP_SIZE=$(stat -c%s "out/backup-${NOW}.dump")
+          SQL_SIZE=$(stat -c%s "out/backup-${NOW}.sql.gz")
+          DUMP_SHA=$(sha256sum "out/backup-${NOW}.dump" | awk '{print $1}')
+          SQL_SHA=$(sha256sum "out/backup-${NOW}.sql.gz" | awk '{print $1}')
+          node -e 'const fs = require("fs"); const rowCounts = JSON.parse(fs.readFileSync("row_counts.json","utf8") || "[]"); const m = { timestamp: "'"$NOW"'", github_run_id: "'"$GITHUB_RUN_ID"'", github_sha: "'"$GITHUB_SHA"'", pg_version: '"'"'"${PG_VERSION}"'"'"'", migrations_sha: "'"${{ steps.manifest.outputs.migrations_sha }}"'", files: { dump: { name: "backup-"'"$NOW"'".dump", bytes: '"$DUMP_SIZE"', sha256: "'"$DUMP_SHA"'" }, sql_gz: { name: "backup-"'"$NOW"'".sql.gz", bytes: '"$SQL_SIZE"', sha256: "'"$SQL_SHA"'" } }, row_counts: rowCounts }; fs.writeFileSync("out/manifest.json", JSON.stringify(m, null, 2));'
+          cat out/manifest.json | head -40
+        env:
+          PG_VERSION: ${{ steps.manifest.outputs.pg_version }}
+
+      - name: Clone backup repo
+        run: |
+          set -euo pipefail
+          git clone --depth=1 "https://x-access-token:${BACKUP_REPO_TOKEN}@github.com/${BACKUP_REPO}.git" backup-repo
+          cd backup-repo
+          git config user.email "db-backup@finixhub.app"
+          git config user.name "finixhub db-backup bot"
+
+      - name: Place daily + latest + maybe monthly
+        run: |
+          set -euo pipefail
+          NOW="${{ steps.ts.outputs.now }}"
+          DAY_PATH="${{ steps.ts.outputs.day_path }}"
+          DOM="${{ steps.ts.outputs.day_of_month }}"
+          YM="${{ steps.ts.outputs.year_month }}"
+          cd backup-repo
+
+          mkdir -p "daily/${DAY_PATH}" latest
+          cp "../out/backup-${NOW}.dump" "daily/${DAY_PATH}/"
+          cp "../out/backup-${NOW}.sql.gz" "daily/${DAY_PATH}/"
+          cp "../out/manifest.json" "daily/${DAY_PATH}/manifest.json"
+
+          # latest/ is always the most recent snapshot (fast lookup for db:compare).
+          rm -f latest/*.dump latest/*.sql.gz latest/manifest.json || true
+          cp "../out/backup-${NOW}.dump" "latest/"
+          cp "../out/backup-${NOW}.sql.gz" "latest/"
+          cp "../out/manifest.json" "latest/manifest.json"
+
+          # First backup of the month becomes the monthly snapshot.
+          if [ "$DOM" = "01" ]; then
+            mkdir -p "monthly/${YM}"
+            cp "../out/backup-${NOW}.dump" "monthly/${YM}/"
+            cp "../out/backup-${NOW}.sql.gz" "monthly/${YM}/"
+            cp "../out/manifest.json" "monthly/${YM}/manifest.json"
+          fi
+
+      - name: Rotate retention (delete old dailies + monthlies)
+        working-directory: backup-repo
+        run: |
+          set -euo pipefail
+          # Delete daily backups older than RETAIN_DAILY days.
+          if [ -d daily ]; then
+            find daily -type f -mtime +${RETAIN_DAILY} -print -delete || true
+            # Remove empty day/month/year dirs.
+            find daily -type d -empty -print -delete || true
+          fi
+          # Keep only the most recent RETAIN_MONTHLY monthly folders.
+          if [ -d monthly ]; then
+            KEEP=${RETAIN_MONTHLY}
+            ls -1 monthly | sort -r | tail -n +$((KEEP + 1)) | while read -r old; do
+              if [ -n "$old" ]; then
+                echo "Pruning monthly/$old"
+                rm -rf "monthly/$old"
+              fi
+            done
+          fi
+
+      - name: Commit & push to backup repo
+        working-directory: backup-repo
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit (unexpected)."
+            exit 0
+          fi
+          git commit -m "backup ${{ steps.ts.outputs.now }} (run ${{ github.run_id }})"
+          git push origin HEAD
+
+      - name: Summary
+        run: |
+          echo "### DB Backup ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Timestamp: ${{ steps.ts.outputs.now }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Repo: ${BACKUP_REPO}" >> $GITHUB_STEP_SUMMARY
+          echo "- Path: daily/${{ steps.ts.outputs.day_path }}/" >> $GITHUB_STEP_SUMMARY
+          echo "- Migrations SHA: ${{ steps.manifest.outputs.migrations_sha }}" >> $GITHUB_STEP_SUMMARY
