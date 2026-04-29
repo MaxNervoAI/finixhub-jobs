@@ -1,0 +1,44 @@
+name: Update Live Demo Plans
+
+on:
+  schedule:
+    # Run at midnight (00:00 UTC) every day
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-live-demo
+  cancel-in-progress: false
+
+jobs:
+  update-demo-plans:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Generate Dynamic Plans
+        run: node scripts/update-demo-plans.mjs
+
+      - name: Commit and Push Changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update daily demo plans [skip ci]"
+          file_pattern: "src/data/demoActivePlans.json"
+          commit_user_name: "finix-bot"
+          commit_user_email: "bot@finixhub.app"
