@@ -18,14 +18,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
  * Fetch current price from Binance API
  */
 async function fetchCurrentPrice(symbol) {
-  try {
-    const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
-    const data = await response.json();
-    return parseFloat(data.price);
-  } catch (error) {
-    console.error(`Error fetching price for ${symbol}:`, error);
-    throw error;
+  const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
+  if (!response.ok) {
+    throw new Error(`Binance API returned ${response.status}`);
   }
+  const data = await response.json();
+  const price = parseFloat(data.price);
+  if (isNaN(price) || price <= 0) {
+    throw new Error(`Invalid price for ${symbol}: ${data.price}`);
+  }
+  return price;
 }
 
 /**
@@ -95,27 +97,8 @@ async function generateScenario(symbol, bias, technicalData, insights, currentPr
     Risk/reward should be at least 2:1. Provide realistic price levels.
   `;
 
-  // Try GPT-4 first, fallback to DeepSeek
+  // Use DeepSeek directly
   try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.GEMINI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7,
-      }),
-    });
-
-    const data = await response.json();
-    return JSON.parse(data.choices[0].message.content);
-  } catch (error) {
-    console.error('GPT-4 failed, trying DeepSeek:', error);
-    
-    // Fallback to DeepSeek
     const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -129,8 +112,19 @@ async function generateScenario(symbol, bias, technicalData, insights, currentPr
       }),
     });
 
+    if (!response.ok) {
+      throw new Error(`DeepSeek API failed: ${response.statusText}`);
+    }
+
     const data = await response.json();
-    return JSON.parse(data.choices[0].message.content);
+    const content = data.choices[0].message.content;
+    // Strip markdown code blocks if present
+    const jsonContent = content.replace(/```json\n?/, '').replace(/```\n?/, '').trim();
+    const parsed = JSON.parse(jsonContent);
+    return parsed;
+  } catch (error) {
+    console.error('DeepSeek failed:', error);
+    throw error;
   }
 }
 
