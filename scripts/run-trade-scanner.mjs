@@ -68,29 +68,28 @@ async function fetchTechnicalIndicators(symbol) {
 }
 
 /**
- * Fetch comprehensive insights
+ * Fetch global market insights (fear_greed_index, etc.)
  */
-async function fetchComprehensiveInsights(symbol) {
+async function fetchGlobalInsights() {
   try {
     const { data, error } = await supabase
-      .from('comprehensive_insights')
-      .select('*')
-      .eq('symbol', symbol)
-      .order('created_at', { ascending: false })
+      .from('global_market_insights')
+      .select('fear_greed_index, momentum_percent, mood_label')
+      .order('date', { ascending: false })
       .limit(1)
       .single();
 
     if (error) {
-      console.warn(`No insights found for ${symbol}:`, error.message);
+      console.warn(`No global insights found:`, error.message);
       return null;
     }
     if (!data) {
-      console.warn(`No insights found for ${symbol}`);
+      console.warn(`No global insights found`);
       return null;
     }
     return data;
   } catch (error) {
-    console.error(`Error fetching comprehensive insights for ${symbol}:`, error);
+    console.error(`Error fetching global insights:`, error);
     return null;
   }
 }
@@ -163,8 +162,10 @@ function calculateQualityScore(scenario, technicalData, insights) {
     thesis_quality: 0,
   };
 
-  // Technical confluence (0-1)
-  if (technicalData?.sma_20 && technicalData?.sma_50) {
+  // Technical confluence (0-1) - use extended_indicators if available
+  const sma20 = technicalData?.extended_indicators?.ma_raw_values?.sma20 || technicalData?.sma_20;
+  const sma50 = technicalData?.sma_50;
+  if (sma20 && sma50) {
     scores.technical_confluence = 0.8;
   }
 
@@ -241,7 +242,7 @@ async function runScanner() {
       const [currentPrice, technicalData, insights] = await Promise.all([
         fetchCurrentPrice(symbol),
         fetchTechnicalIndicators(symbol),
-        fetchComprehensiveInsights(symbol),
+        fetchGlobalInsights(),
       ]);
 
       console.log(`   Current price: $${currentPrice}`);
@@ -307,7 +308,7 @@ async function runScanner() {
   }));
 
   // Apply contrarian retail interest logic
-  const adjustedScenarios = applyContrarianLogic(allScenarios, await fetchComprehensiveInsights('BTC'));
+  const adjustedScenarios = applyContrarianLogic(allScenarios, await fetchGlobalInsights());
 
   // Rank by quality score
   adjustedScenarios.sort((a, b) => b.quality_score - a.quality_score);
