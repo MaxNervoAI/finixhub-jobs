@@ -70,6 +70,7 @@ jobs:
           NOW="${{ steps.ts.outputs.now }}"
           echo "Creating custom-format dump..."
           docker run --rm \
+            -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) \
             postgres:${PG_MAJOR} \
             pg_dump "$SUPABASE_DB_URL" \
             --format=custom \
@@ -79,6 +80,7 @@ jobs:
             > "out/backup-${NOW}.dump"
           echo "Creating plain SQL dump (gzipped)..."
           docker run --rm \
+            -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) \
             postgres:${PG_MAJOR} \
             pg_dump "$SUPABASE_DB_URL" \
             --format=plain \
@@ -94,6 +96,7 @@ jobs:
           # Row counts per user table (public schema) via pg_class for speed, then
           # precise counts per table for correctness.
           docker run --rm \
+            -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) \
             postgres:${PG_MAJOR} \
             psql "$SUPABASE_DB_URL" -Atc "
             select json_agg(row_to_json(t))
@@ -103,7 +106,7 @@ jobs:
               order by schemaname, relname
             ) t;
           " > row_counts.json
-          PG_VERSION=$(docker run --rm postgres:${PG_MAJOR} psql "$SUPABASE_DB_URL" -Atc "select version();")
+          PG_VERSION=$(docker run --rm -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) postgres:${PG_MAJOR} psql "$SUPABASE_DB_URL" -Atc "select version();")
           echo "pg_version=$PG_VERSION" >> "$GITHUB_OUTPUT"
           # Compute migrations SHA if migrations directory exists (may not in public repo)
           if [ -d supabase/migrations ]; then
