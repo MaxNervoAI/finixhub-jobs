@@ -63,16 +63,24 @@ jobs:
           echo "year_month=$YEAR_MONTH" >> "$GITHUB_OUTPUT"
           echo "day_of_month=$DAY_OF_MONTH" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve IPv4 address
+        id: ipv4
+        run: |
+          IPV4_ADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1)
+          echo "ipv4_addr=$IPV4_ADDR" >> "$GITHUB_OUTPUT"
+          echo "Resolved IPv4: $IPV4_ADDR"
+
       - name: Create dumps
         run: |
           set -euo pipefail
           mkdir -p out
           NOW="${{ steps.ts.outputs.now }}"
+          IPV4="${{ steps.ipv4.outputs.ipv4_addr }}"
           echo "Creating custom-format dump..."
           docker run --rm \
-            -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) \
             postgres:${PG_MAJOR} \
             pg_dump "$SUPABASE_DB_URL" \
+            --host="$IPV4" \
             --format=custom \
             --compress=9 \
             --no-owner \
@@ -80,9 +88,9 @@ jobs:
             > "out/backup-${NOW}.dump"
           echo "Creating plain SQL dump (gzipped)..."
           docker run --rm \
-            -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) \
             postgres:${PG_MAJOR} \
             pg_dump "$SUPABASE_DB_URL" \
+            --host="$IPV4" \
             --format=plain \
             --no-owner \
             --no-privileges \
@@ -95,10 +103,12 @@ jobs:
           set -euo pipefail
           # Row counts per user table (public schema) via pg_class for speed, then
           # precise counts per table for correctness.
+          IPV4="${{ steps.ipv4.outputs.ipv4_addr }}"
           docker run --rm \
-            -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) \
             postgres:${PG_MAJOR} \
-            psql "$SUPABASE_DB_URL" -Atc "
+            psql "$SUPABASE_DB_URL" \
+            --host="$IPV4" \
+            -Atc "
             select json_agg(row_to_json(t))
             from (
               select schemaname, relname as table_name, n_live_tup as row_count
@@ -106,7 +116,7 @@ jobs:
               order by schemaname, relname
             ) t;
           " > row_counts.json
-          PG_VERSION=$(docker run --rm -e PGHOSTADDR=$(dig +short A db.yggzlbjlydhxqmllvyyx.supabase.co | head -1) postgres:${PG_MAJOR} psql "$SUPABASE_DB_URL" -Atc "select version();")
+          PG_VERSION=$(docker run --rm postgres:${PG_MAJOR} psql "$SUPABASE_DB_URL" --host="$IPV4" -Atc "select version();")
           echo "pg_version=$PG_VERSION" >> "$GITHUB_OUTPUT"
           # Compute migrations SHA if migrations directory exists (may not in public repo)
           if [ -d supabase/migrations ]; then
