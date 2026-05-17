@@ -21,7 +21,11 @@ async function fetchCurrentPrice(symbol) {
   try {
     const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
     const data = await response.json();
-    return parseFloat(data.price);
+    const price = parseFloat(data.price);
+    if (isNaN(price)) {
+      throw new Error(`Invalid price for ${symbol}: ${data.price}`);
+    }
+    return price;
   } catch (error) {
     console.error(`Error fetching price for ${symbol}:`, error);
     throw error;
@@ -110,8 +114,16 @@ async function generateScenario(symbol, bias, technicalData, insights, currentPr
       }),
     });
 
+    if (!response.ok) {
+      throw new Error(`AI API failed: ${response.statusText}`);
+    }
+
     const data = await response.json();
-    return JSON.parse(data.choices[0].message.content);
+    const content = data.choices[0].message.content;
+    // Strip markdown code blocks if present
+    const jsonContent = content.replace(/```json\n?/, '').replace(/```\n?/, '').trim();
+    const parsed = JSON.parse(jsonContent);
+    return parsed;
   } catch (error) {
     console.error('GPT-4 failed, trying DeepSeek:', error);
     
@@ -130,7 +142,10 @@ async function generateScenario(symbol, bias, technicalData, insights, currentPr
     });
 
     const data = await response.json();
-    return JSON.parse(data.choices[0].message.content);
+    const content = data.choices[0].message.content;
+    // Strip markdown code blocks if present
+    const jsonContent = content.replace(/```json\n?/, '').replace(/```\n?/, '').trim();
+    return JSON.parse(jsonContent);
   }
 }
 
