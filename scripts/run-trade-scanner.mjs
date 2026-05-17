@@ -15,19 +15,28 @@ const ASSETS = ['BTC', 'ETH', 'SOL'];
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /**
- * Fetch current price from Binance API
+ * Fetch current price from asset_daily_summary table (avoids Binance API geo-blocking)
  */
 async function fetchCurrentPrice(symbol) {
-  const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
-  if (!response.ok) {
-    throw new Error(`Binance API returned ${response.status}`);
+  try {
+    const { data, error } = await supabase
+      .from('asset_daily_summary')
+      .select('close')
+      .eq('symbol', symbol)
+      .order('date', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error) throw error;
+    if (!data || !data.close) {
+      throw new Error(`No price data found for ${symbol}`);
+    }
+
+    return parseFloat(data.close);
+  } catch (error) {
+    console.error(`Error fetching price for ${symbol} from database:`, error);
+    throw error;
   }
-  const data = await response.json();
-  const price = parseFloat(data.price);
-  if (isNaN(price) || price <= 0) {
-    throw new Error(`Invalid price for ${symbol}: ${data.price}`);
-  }
-  return price;
 }
 
 /**
