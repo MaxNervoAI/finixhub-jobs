@@ -18,35 +18,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
  * Fetch current price from Binance API
  */
 async function fetchCurrentPrice(symbol) {
-  try {
-    const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
-    if (!response.ok) {
-      throw new Error(`Binance API returned ${response.status}`);
-    }
-    const data = await response.json();
-    const price = parseFloat(data.price);
-    if (isNaN(price) || price <= 0) {
-      throw new Error(`Invalid price for ${symbol}: ${data.price}`);
-    }
-    return price;
-  } catch (error) {
-    console.error(`Error fetching price for ${symbol}:`, error);
-    // Return a fallback price based on asset symbol
-    const fallbackPrices = {
-      BTC: 95000,
-      ETH: 3500,
-      SOL: 150,
-      AVAX: 40,
-      ADA: 0.5,
-      DOT: 7,
-      MATIC: 0.8,
-      LINK: 15,
-      UNI: 10,
-      AAVE: 150
-    };
-    console.warn(`Using fallback price for ${symbol}: $${fallbackPrices[symbol]}`);
-    return fallbackPrices[symbol] || 100;
+  const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
+  if (!response.ok) {
+    throw new Error(`Binance API returned ${response.status}`);
   }
+  const data = await response.json();
+  const price = parseFloat(data.price);
+  if (isNaN(price) || price <= 0) {
+    throw new Error(`Invalid price for ${symbol}: ${data.price}`);
+  }
+  return price;
 }
 
 /**
