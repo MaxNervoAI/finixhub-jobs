@@ -52,11 +52,18 @@ async function fetchTechnicalIndicators(symbol) {
       .limit(1)
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.warn(`No technical data found for ${symbol}:`, error.message);
+      return null;
+    }
+    if (!data) {
+      console.warn(`No technical data found for ${symbol}`);
+      return null;
+    }
     return data;
   } catch (error) {
     console.error(`Error fetching technical indicators for ${symbol}:`, error);
-    throw error;
+    return null;
   }
 }
 
@@ -73,11 +80,18 @@ async function fetchComprehensiveInsights(symbol) {
       .limit(1)
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.warn(`No insights found for ${symbol}:`, error.message);
+      return null;
+    }
+    if (!data) {
+      console.warn(`No insights found for ${symbol}`);
+      return null;
+    }
     return data;
   } catch (error) {
     console.error(`Error fetching comprehensive insights for ${symbol}:`, error);
-    throw error;
+    return null;
   }
 }
 
