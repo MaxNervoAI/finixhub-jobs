@@ -194,19 +194,8 @@ async function main() {
                 continue; // No summary data for this date
             }
 
-            // Ensure a '1d' candle exists in market_data_ohlcv for this date
-            // (sync-binance-ohlcv only writes 1m candles; Key Levels need 1d)
-            await supabase.from('market_data_ohlcv').upsert({
-                symbol,
-                timeframe: '1d',
-                timestamp: new Date(targetDate).toISOString(),
-                open: summary.open,
-                high: summary.high,
-                low: summary.low,
-                close: summary.close,
-                volume: summary.volume,
-            }, { onConflict: 'symbol,timeframe,timestamp' });
-
+            // Fetch 1d candles from market_data_ohlcv for key levels calculation
+            // (sync-binance-ohlcv now writes 1d candles directly from Binance)
             const { data: candles } = await supabase
                 .from('market_data_ohlcv')
                 .select('high, low, close, volume')
