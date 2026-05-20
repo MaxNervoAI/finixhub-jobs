@@ -1,16 +1,12 @@
 /**
  * sync-binance-ohlcv.ts
  *
- * Fetches recent 1-minute OHLCV candles from Binance for all active assets.
+ * Fetches daily (1d) OHLCV candles from Binance for all active assets.
  *
  * Usage: npx tsx scripts/sync-binance-ohlcv.ts
  */
 
 import { createClient } from '@supabase/supabase-js';
-
-function snapToMinute(timestamp: number): number {
-    return Math.floor(timestamp / 60000) * 60000;
-}
 
 // ---- Binance helper ----
 async function fetchBinance(path: string) {
@@ -41,7 +37,7 @@ async function main() {
     const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
     const startTime = Date.now();
 
-    console.log('🚀 Starting Binance 1m OHLCV sync...\n');
+    console.log('🚀 Starting Binance 1d OHLCV sync...\n');
 
     const { data: assets, error } = await supabase
         .from('assets')
@@ -64,7 +60,7 @@ async function main() {
     for (let i = 0; i < assets.length; i++) {
         const { symbol, binance_symbol } = assets[i];
         try {
-            const path = `/api/v3/klines?symbol=${binance_symbol}&interval=1m&limit=5`;
+            const path = `/api/v3/klines?symbol=${binance_symbol}&interval=1d&limit=30`;
             const response = await fetchBinance(path);
 
             if (!response.ok) {
@@ -86,8 +82,8 @@ async function main() {
 
             const candles = klines.map(k => ({
                 symbol,
-                timeframe: '1m',
-                timestamp: new Date(snapToMinute(k[0])).toISOString(),
+                timeframe: '1d',
+                timestamp: new Date(k[0]).toISOString(),
                 open: parseFloat(k[1]),
                 high: parseFloat(k[2]),
                 low: parseFloat(k[3]),
