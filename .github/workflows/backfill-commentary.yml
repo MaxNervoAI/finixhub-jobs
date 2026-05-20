@@ -1,0 +1,40 @@
+name: Backfill Daily Commentary
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date to backfill (YYYY-MM-DD format)'
+        required: true
+        type: string
+      symbols:
+        description: 'Symbols to backfill (comma-separated, e.g., BTC,ETH,SOL)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-commentary
+  cancel-in-progress: false
+
+jobs:
+  backfill-commentary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Backfill daily commentary
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+        run: npx tsx scripts/generate-daily-insights.ts --date ${{ inputs.date }} --symbols ${{ inputs.symbols }}
