@@ -116,12 +116,27 @@ async function fetchMarketInsights(supabase, asset) {
   };
 }
 
+const COINGECKO_IDS = { BTC: "bitcoin", ETH: "ethereum", SOL: "solana" };
+
 async function fetchCurrentPrice(asset) {
   const symbol = `${asset}USDT`;
-  const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
-  if (!res.ok) throw new Error(`Binance price fetch failed for ${symbol}: ${res.status}`);
-  const json = await res.json();
-  return parseFloat(json.price);
+
+  // Try Binance first — geo-blocked (451) in GitHub Actions US runners, fall through
+  try {
+    const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+    if (res.status === 451) throw new Error("geo-blocked");
+    if (!res.ok) throw new Error(`Binance price fetch failed for ${symbol}: ${res.status}`);
+    const json = await res.json();
+    return parseFloat(json.price);
+  } catch {
+    // Fall back to CoinGecko (no geo-restrictions, no auth required)
+    const id = COINGECKO_IDS[asset];
+    if (!id) throw new Error(`No CoinGecko ID for ${asset}`);
+    const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`);
+    if (!res.ok) throw new Error(`CoinGecko price fetch failed for ${asset}: ${res.status}`);
+    const json = await res.json();
+    return json[id].usd;
+  }
 }
 
 // ─── Scoring ────────────────────────────────────────────────────────────────
