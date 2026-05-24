@@ -539,7 +539,7 @@ async function main() {
 
     const { error: perfError } = await supabase
       .from("opportunity_performance")
-      .insert(perfRows);
+      .upsert(perfRows, { onConflict: "source,simulation_date,asset_symbol,bias,scoring_version" });
 
     if (perfError) {
       // Non-fatal: log but don't abort — opportunities are still stored
