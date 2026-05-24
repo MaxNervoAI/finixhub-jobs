@@ -27,6 +27,12 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: node scripts/run-performance-check.mjs
 
+      - name: Run opportunity performance check
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/run-opportunity-perf-check.mjs
+
       - name: Notify on failure
         if: failure()
         run: echo "Performance check workflow failed"
