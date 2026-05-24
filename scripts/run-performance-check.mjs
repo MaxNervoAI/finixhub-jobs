@@ -15,14 +15,22 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 /**
  * Fetch current price from Binance API
  */
+const COINGECKO_IDS = { BTC: "bitcoin", ETH: "ethereum", SOL: "solana" };
+
 async function fetchCurrentPrice(symbol) {
   try {
-    const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
-    const data = await response.json();
+    const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
+    if (res.status === 451) throw new Error("geo-blocked");
+    if (!res.ok) throw new Error(`Binance fetch failed: ${res.status}`);
+    const data = await res.json();
     return parseFloat(data.price);
-  } catch (error) {
-    console.error(`Error fetching price for ${symbol}:`, error);
-    throw error;
+  } catch {
+    const id = COINGECKO_IDS[symbol];
+    if (!id) throw new Error(`No CoinGecko ID for ${symbol}`);
+    const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`);
+    if (!res.ok) throw new Error(`CoinGecko fetch failed for ${symbol}: ${res.status}`);
+    const data = await res.json();
+    return data[id].usd;
   }
 }
 
@@ -128,7 +136,7 @@ async function runPerformanceCheck() {
           time_to_tp_hours: tpHit ? timeElapsed : null,
           time_to_sl_hours: slHit ? timeElapsed : null,
           whipsaw,
-          final_status,
+          final_status: finalStatus,
           checked_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         }, {
