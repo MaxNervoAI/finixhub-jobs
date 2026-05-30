@@ -147,8 +147,10 @@ async function run() {
 
         let historicalPrice = await fetchBinanceHistoricalPrice(asset);
         if (!historicalPrice) {
-            historicalPrice = currentPrice * 0.99;
-            console.warn(`  Historical fallback: $${historicalPrice.toFixed(2)}`);
+            // If klines failed, estimate yesterday's close from 24h change
+            const changeRatio = 1 + (ticker.changePercent / 100);
+            historicalPrice = changeRatio !== 1 ? currentPrice / changeRatio : currentPrice * 0.99;
+            console.warn(`  Historical from 24h change: $${historicalPrice.toFixed(2)}`);
         } else {
             console.log(`  Historical (prev day close): $${historicalPrice.toFixed(2)}`);
         }

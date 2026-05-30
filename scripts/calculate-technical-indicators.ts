@@ -51,8 +51,8 @@ async function calculateForSymbol(supabase: any, symbol: string, date: string) {
     }
 
     // 2. Also get the "current" day's data (the one we are calculating for)
-    // This aggregates 1m candles into a daily candle for "today"
-    const { data: currentDay, error: currentError } = await supabase.rpc('get_daily_candles_from_1m', {
+    // This reads 1d candles for "today"
+    const { data: currentDay, error: currentError } = await supabase.rpc('get_daily_candles', {
         p_symbol: symbol,
         p_start_date: date,
         p_end_date: date,

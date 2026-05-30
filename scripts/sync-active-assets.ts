@@ -81,7 +81,11 @@ async function main() {
     for (let page = 1; page <= pages; page++) {
         const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}&sparkline=false`;
         try {
-            const res = await fetch(url);
+            const cgHeaders: Record<string, string> = {};
+            if (process.env.COINGECKO_API_KEY) {
+                cgHeaders['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
+            }
+            const res = await fetch(url, { headers: cgHeaders });
             if (!res.ok) { console.warn(`  CoinGecko page ${page} failed: ${res.status}`); break; }
             const coins: CoinGeckoMarket[] = await res.json();
             if (coins.length === 0) break;
