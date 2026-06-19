@@ -116,7 +116,9 @@ async function openTrade(exchange, signal, riskUsd) {
   }
 
   // ── 1. Place limit entry ────────────────────────────────────────────────────
-  const mainOrder = await exchange.createOrder(symbol, "limit", side, posSize, entryPrice);
+  const mainOrder = await exchange.createOrder(symbol, "limit", side, posSize, entryPrice, {
+    postOnly: true,
+  });
   console.log(`[hl-trader] ✓ Limit entry at $${entryPrice} | id:${mainOrder.id}`);
 
   // ── 2. Poll for fill (30s intervals, up to 10 min) ─────────────────────────
@@ -179,6 +181,7 @@ async function openTrade(exchange, signal, riskUsd) {
   let tpOrderId = null;
   try {
     const tpOrder = await exchange.createOrder(symbol, "limit", slSide, posSize, tpAdjusted, {
+      postOnly: true,
       reduceOnly: true,
     });
     tpOrderId = tpOrder.id;
