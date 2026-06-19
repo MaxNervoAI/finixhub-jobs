@@ -1,0 +1,40 @@
+name: Hyperliquid Signal Trader
+
+on:
+  schedule:
+    # 30 min after the trade scanner fires (scanner runs at 0:00 and 12:00 UTC)
+    - cron: '30 0,12 * * *'
+  workflow_dispatch: # Allow manual trigger at any time
+
+jobs:
+  trade:
+    name: Open HL trades for new aligned signals
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # allows 10min fill poll per signal + overhead
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run signal trader
+        run: node scripts/hl-signal-trader.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          HL_WALLET_ADDRESS: ${{ secrets.HL_WALLET_ADDRESS }}
+          HL_PRIVATE_KEY: ${{ secrets.HL_PRIVATE_KEY }}
+          HL_TESTNET: ${{ secrets.HL_TESTNET }}
+          HL_RISK_PER_TRADE_USD: ${{ secrets.HL_RISK_PER_TRADE_USD }}
+          HL_ENTRY_TIMEOUT_MIN: '10'
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Hyperliquid signal trader failed"
