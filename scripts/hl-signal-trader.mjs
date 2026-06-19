@@ -516,15 +516,16 @@ async function main() {
       const newTpIsBetter = newTp && existingTp && (
         isLong ? parseFloat(newTp) > existingTp : parseFloat(newTp) < existingTp
       );
+      const qualifiesForUpgrade = signal.quality_score >= FLIP_MIN_QUALITY; // reuse ≥85 threshold
 
-      if (!newTpIsBetter) {
-        console.log(`[hl-trader] ⊘ Skipping — already have ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} open, TP not better (existing:$${existingTp} new:$${newTp})`);
+      if (!newTpIsBetter || !qualifiesForUpgrade) {
+        console.log(`[hl-trader] ⊘ Skipping — already have ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} open (TP better:${newTpIsBetter}, quality ok:${qualifiesForUpgrade})`);
         skipped++;
         continue;
       }
 
-      // Better TP — cancel existing TP order and place a new one
-      console.log(`[hl-trader] ↑ Better TP found for ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} — upgrading $${existingTp} → $${newTp}`);
+      // High-quality signal with better TP — upgrade exit target
+      console.log(`[hl-trader] ↑ TP upgrade for ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} — quality:${signal.quality_score} | $${existingTp} → $${newTp}`);
       await upgradeTp(exchange, signal, dbRecord);
       skipped++; // not a new position
       continue;
