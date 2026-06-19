@@ -116,7 +116,9 @@ async function openTrade(exchange, signal, riskUsd) {
   }
 
   // ── 1. Place market entry (ensure immediate fill at current price) ──────────
-  const mainOrder = await exchange.createOrder(symbol, "market", side, posSize);
+  const mainOrder = await exchange.createOrder(symbol, "market", side, posSize, entryPrice, {
+    slippagePercentage: 5, // Allow up to 5% slippage for market orders
+  });
   console.log(`[hl-trader] ✓ Market entry | id:${mainOrder.id}`);
 
   // ── 2. Market order fills immediately; get actual fill price ─────────────────
