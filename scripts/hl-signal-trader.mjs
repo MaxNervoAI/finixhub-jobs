@@ -109,15 +109,21 @@ async function fetchOpenHLPositions(exchange) {
 async function fetchOpenDBRecords() {
   const { data } = await supabase
     .from("hyperliquid_trades")
-    .select("id, asset_symbol, bias, signal_quality_score, signal_sl, signal_tp1, actual_entry_price, hl_sl_order_id, hl_tp_order_id")
+    .select("id, asset_symbol, bias, signal_quality_score, signal_sl, signal_tp1, actual_entry_price, position_size_contracts, hl_sl_order_id, hl_tp_order_id")
     .eq("outcome", "open")
     .eq("environment", TESTNET ? "testnet" : "mainnet");
-  // Group by asset — if multiple (stacked), use highest quality as the reference
+
+  // Group by asset: use highest quality record as reference, sum all sizes
   const byAsset = {};
   for (const rec of (data ?? [])) {
-    const existing = byAsset[rec.asset_symbol];
-    if (!existing || rec.signal_quality_score > existing.signal_quality_score) {
-      byAsset[rec.asset_symbol] = rec;
+    const size = parseFloat(rec.position_size_contracts ?? 0);
+    if (!byAsset[rec.asset_symbol]) {
+      byAsset[rec.asset_symbol] = { ...rec, totalSize: size };
+    } else {
+      byAsset[rec.asset_symbol].totalSize += size;
+      if (rec.signal_quality_score > byAsset[rec.asset_symbol].signal_quality_score) {
+        byAsset[rec.asset_symbol] = { ...rec, totalSize: byAsset[rec.asset_symbol].totalSize };
+      }
     }
   }
   return byAsset;
@@ -460,15 +466,29 @@ async function main() {
     }
 
     // Opposite direction — evaluate whether to flip
-    // Use HL live data for P&L if available, fall back to DB entry price
+    // Use HL live data for P&L if available, otherwise fetch ticker for current price
     const hlPos = openHLPositions[signal.asset_symbol];
-    const existingPos = hlPos ?? {
-      side: dbRecord.bias,
-      entryPrice: parseFloat(dbRecord.actual_entry_price ?? 0),
-      markPrice: null,
-      percentage: null,
-    };
-    const currentPrice = existingPos.markPrice ?? existingPos.entryPrice;
+    let currentPrice;
+    let existingPos;
+    if (hlPos) {
+      existingPos = hlPos;
+      currentPrice = hlPos.markPrice ?? hlPos.entryPrice;
+    } else {
+      // HL position fetch failed — get current price from ticker
+      try {
+        const ticker = await exchange.fetchTicker(HL_SYMBOL[signal.asset_symbol]);
+        currentPrice = ticker.last;
+      } catch (_) {
+        currentPrice = parseFloat(dbRecord.actual_entry_price ?? 0);
+      }
+      existingPos = {
+        side: dbRecord.bias,
+        entryPrice: parseFloat(dbRecord.actual_entry_price ?? 0),
+        markPrice: currentPrice,
+        percentage: null,
+        size: dbRecord.totalSize,
+      };
+    }
     const { close, reason } = evaluateFlip(existingPos, dbRecord, signal, currentPrice);
 
     console.log(`[hl-trader] ↔ Conflict: open ${existingPos.side.toUpperCase()} vs new ${signal.bias.toUpperCase()} | ${reason}`);
