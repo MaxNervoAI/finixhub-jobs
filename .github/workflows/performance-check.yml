@@ -33,6 +33,15 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: node scripts/run-opportunity-perf-check.mjs
 
+      - name: Sync Hyperliquid trade outcomes
+        run: node scripts/hl-sync-results.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          HL_WALLET_ADDRESS: ${{ secrets.HL_WALLET_ADDRESS }}
+          HL_PRIVATE_KEY: ${{ secrets.HL_PRIVATE_KEY }}
+          HL_TESTNET: ${{ secrets.HL_TESTNET }}
+
       - name: Notify on failure
         if: failure()
         run: echo "Performance check workflow failed"

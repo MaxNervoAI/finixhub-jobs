@@ -19,6 +19,7 @@
   "dependencies": {
     "@mozilla/readability": "^0.5.0",
     "@supabase/supabase-js": "^2.103.3",
+    "ccxt": "^4.5.59",
     "dotenv": "^16.4.5",
     "jsdom": "^27.0.1",
     "rss-parser": "^3.13.0",
