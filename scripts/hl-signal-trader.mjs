@@ -115,44 +115,14 @@ async function openTrade(exchange, signal, riskUsd) {
     return null;
   }
 
-  // ── 1. Place limit entry ────────────────────────────────────────────────────
-  const mainOrder = await exchange.createOrder(symbol, "limit", side, posSize, entryPrice, {
-    postOnly: true,
-  });
-  console.log(`[hl-trader] ✓ Limit entry at $${entryPrice} | id:${mainOrder.id}`);
+  // ── 1. Place market entry (ensure immediate fill at current price) ──────────
+  const mainOrder = await exchange.createOrder(symbol, "market", side, posSize);
+  console.log(`[hl-trader] ✓ Market entry | id:${mainOrder.id}`);
 
-  // ── 2. Poll for fill (30s intervals, up to 10 min) ─────────────────────────
-  // Entry = current market price, so fills within seconds in normal conditions.
-  // Once filled → immediately place SL+TP so position is never unprotected.
-  const FILL_POLL_INTERVAL = 30_000;
-  const FILL_TIMEOUT = parseInt(process.env.HL_ENTRY_TIMEOUT_MIN ?? "10") * 60_000;
-  const deadline = Date.now() + FILL_TIMEOUT;
-  let actualEntry = null;
-
-  while (Date.now() < deadline) {
-    await sleep(FILL_POLL_INTERVAL);
-    try {
-      const o = await exchange.fetchOrder(mainOrder.id, symbol);
-      if (o.status === "canceled" || o.status === "rejected") {
-        throw new Error(`Entry order ${o.status} — price likely moved away`);
-      }
-      if (o.status === "closed" || o.status === "filled") {
-        actualEntry = o.average ?? entryPrice;
-        console.log(`[hl-trader] ✓ Filled at $${actualEntry}`);
-        break;
-      }
-      const remainMin = ((deadline - Date.now()) / 60000).toFixed(1);
-      console.log(`[hl-trader] Waiting for fill... (${remainMin}min left)`);
-    } catch (e) {
-      throw new Error(`Fill check failed: ${e.message}`);
-    }
-  }
-
-  if (!actualEntry) {
-    // Timeout — cancel stale order, skip this signal
-    try { await exchange.cancelOrder(mainOrder.id, symbol); } catch (_) {}
-    throw new Error(`Entry not filled within ${FILL_TIMEOUT / 60000}min — signal stale, cancelled`);
-  }
+  // ── 2. Market order fills immediately; get actual fill price ─────────────────
+  // For market orders, CCXT fills immediately and returns status 'closed'
+  const actualEntry = mainOrder.average ?? mainOrder.info?.average ?? entryPrice;
+  console.log(`[hl-trader] ✓ Filled at $${actualEntry}`);
 
   // ── 3. Place SL immediately after fill ────────────────────────────────────
   // Adjust SL/TP proportionally if actual fill differs from signal entry
