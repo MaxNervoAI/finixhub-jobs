@@ -192,8 +192,57 @@ function evaluateFlip(existingPos, dbRecord, newSignal, currentPrice) {
   return { close: false, reason: `no flip criteria met (pnl:${pnlPct.toFixed(1)}%, quality:${newQuality})` };
 }
 
+// ── Upgrade TP on an existing same-direction position ─────────────────────────
+async function upgradeTp(exchange, signal, dbRecord) {
+  const symbol = HL_SYMBOL[signal.asset_symbol];
+  const isLong = signal.bias === "long";
+  const tpSide = isLong ? "sell" : "buy";
+  const newTpRaw = parseFloat(signal.take_profit_levels[0].level);
+  const actualEntry = parseFloat(dbRecord.actual_entry_price ?? signal.entry_price);
+  const signalEntry = parseFloat(signal.entry_price);
+  // Adjust TP proportionally to the actual fill price
+  const newTpAdjusted = round(newTpRaw * (actualEntry / signalEntry), 2);
+  const posSize = dbRecord.totalSize;
+
+  if (DRY_RUN) {
+    console.log(`[hl-trader] DRY RUN — would upgrade TP to $${newTpAdjusted}`);
+    return;
+  }
+
+  // Cancel existing TP order
+  if (dbRecord.hl_tp_order_id) {
+    try {
+      await exchange.cancelOrder(dbRecord.hl_tp_order_id, symbol);
+      console.log(`[hl-trader] ✓ Cancelled old TP order ${dbRecord.hl_tp_order_id}`);
+    } catch (e) {
+      console.warn(`[hl-trader] Could not cancel old TP (may already be filled): ${e.message}`);
+    }
+  }
+
+  // Place new TP
+  try {
+    const tpOrder = await exchange.createOrder(symbol, "limit", tpSide, posSize, newTpAdjusted, {
+      postOnly: true,
+      reduceOnly: true,
+    });
+    console.log(`[hl-trader] ✓ New TP at $${newTpAdjusted} | id:${tpOrder.id}`);
+
+    // Update all open DB records for this asset with the new TP order id and level
+    await supabase
+      .from("hyperliquid_trades")
+      .update({ hl_tp_order_id: tpOrder.id, signal_tp1: newTpRaw })
+      .eq("asset_symbol", signal.asset_symbol)
+      .eq("outcome", "open")
+      .eq("environment", TESTNET ? "testnet" : "mainnet");
+
+    console.log(`[hl-trader] ✓ DB updated with new TP`);
+  } catch (e) {
+    console.warn(`[hl-trader] ✗ TP upgrade failed (original TP cancelled, SL still protects): ${e.message}`);
+  }
+}
+
 // ── Close an existing position and cancel its SL/TP orders ───────────────────
-async function closeExistingPosition(exchange, asset, existingPos, dbRecords) {
+async function closeExistingPosition(exchange, asset, existingPos) {
   const symbol = HL_SYMBOL[asset];
   const closeSide = existingPos.side === "long" ? "sell" : "buy";
   const currentPrice = existingPos.markPrice ?? existingPos.entryPrice;
@@ -458,10 +507,26 @@ async function main() {
       continue;
     }
 
-    // Same direction — already in this trade
+    // Same direction — check if new signal has a better TP worth upgrading to
     if (dbRecord.bias === signal.bias) {
-      console.log(`[hl-trader] ⊘ Skipping — already have ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} position open`);
-      skipped++;
+      const newTp = signal.take_profit_levels?.[0]?.level;
+      const existingTp = dbRecord.signal_tp1 ? parseFloat(dbRecord.signal_tp1) : null;
+      const isLong = signal.bias === "long";
+
+      const newTpIsBetter = newTp && existingTp && (
+        isLong ? parseFloat(newTp) > existingTp : parseFloat(newTp) < existingTp
+      );
+
+      if (!newTpIsBetter) {
+        console.log(`[hl-trader] ⊘ Skipping — already have ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} open, TP not better (existing:$${existingTp} new:$${newTp})`);
+        skipped++;
+        continue;
+      }
+
+      // Better TP — cancel existing TP order and place a new one
+      console.log(`[hl-trader] ↑ Better TP found for ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} — upgrading $${existingTp} → $${newTp}`);
+      await upgradeTp(exchange, signal, dbRecord);
+      skipped++; // not a new position
       continue;
     }
 
@@ -501,7 +566,7 @@ async function main() {
 
     // Close existing and open new
     try {
-      await closeExistingPosition(exchange, signal.asset_symbol, existingPos, openDBRecords);
+      await closeExistingPosition(exchange, signal.asset_symbol, existingPos);
       await sleep(1000);
       const execution = await openTrade(exchange, signal, RISK_USD);
       await recordTrade(signal, execution, RISK_USD);
