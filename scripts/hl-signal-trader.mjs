@@ -75,28 +75,37 @@ function calcPositionSize(riskUsd, entryPrice, slPrice, amtPrecision) {
   return round(rawSize, decimals);
 }
 
-// ── Fetch open positions from Hyperliquid ─────────────────────────────────────
+// ── Fetch open positions from Hyperliquid (for live P&L only) ────────────────
+// Returns empty object on failure — DB records are the source of truth for
+// conflict detection. HL data is only used to enrich P&L for flip evaluation.
 async function fetchOpenHLPositions(exchange) {
-  const positions = await exchange.fetchPositions();
-  const open = {};
-  for (const pos of positions) {
-    if (!pos.contracts || Math.abs(pos.contracts) === 0) continue;
-    const asset = SYMBOL_TO_ASSET[pos.symbol];
-    if (!asset) continue;
-    open[asset] = {
-      symbol: pos.symbol,
-      side: pos.side, // 'long' or 'short'
-      size: Math.abs(pos.contracts),
-      entryPrice: pos.entryPrice,
-      markPrice: pos.markPrice,
-      unrealizedPnl: pos.unrealizedPnl,
-      percentage: pos.percentage,
-    };
+  try {
+    const positions = await exchange.fetchPositions();
+    const open = {};
+    for (const pos of positions) {
+      if (!pos.contracts || Math.abs(pos.contracts) === 0) continue;
+      const asset = SYMBOL_TO_ASSET[pos.symbol];
+      if (!asset) continue;
+      open[asset] = {
+        symbol: pos.symbol,
+        side: pos.side,
+        size: Math.abs(pos.contracts),
+        entryPrice: pos.entryPrice,
+        markPrice: pos.markPrice,
+        unrealizedPnl: pos.unrealizedPnl,
+        percentage: pos.percentage,
+      };
+    }
+    const count = Object.keys(open).length;
+    console.log(`[hl-trader] HL positions fetched: ${count > 0 ? Object.keys(open).join(", ") : "none"}`);
+    return open;
+  } catch (e) {
+    console.warn(`[hl-trader] Could not fetch HL positions (${e.message}) — using DB records only`);
+    return {};
   }
-  return open;
 }
 
-// ── Fetch our open DB records (for original signal quality/SL/TP) ─────────────
+// ── Fetch our open DB records — PRIMARY source of truth for conflict detection ─
 async function fetchOpenDBRecords() {
   const { data } = await supabase
     .from("hyperliquid_trades")
@@ -387,15 +396,17 @@ async function main() {
   await exchange.loadMarkets();
 
   // Fetch current state upfront
+  // DB records are the PRIMARY source of truth for conflict detection.
+  // HL positions are fetched for live P&L enrichment only (may be empty on testnet).
   const [signals, openHLPositions, openDBRecords] = await Promise.all([
     fetchNewSignals(),
     fetchOpenHLPositions(exchange),
     fetchOpenDBRecords(),
   ]);
 
-  const openAssets = Object.keys(openHLPositions);
+  const dbOpenAssets = Object.keys(openDBRecords);
   console.log(`[hl-trader] Found ${signals.length} new signal(s) to process.`);
-  console.log(`[hl-trader] Open positions: ${openAssets.length > 0 ? openAssets.join(", ") : "none"}\n`);
+  console.log(`[hl-trader] Open positions (DB): ${dbOpenAssets.length > 0 ? dbOpenAssets.join(", ") : "none"}\n`);
 
   if (signals.length === 0) {
     console.log("[hl-trader] Nothing to do. Run again after the next scanner cycle.");
@@ -422,15 +433,16 @@ async function main() {
   for (const signal of dedupedSignals) {
     console.log(`[hl-trader] ── Processing ${signal.asset_symbol} ${signal.bias.toUpperCase()} (quality:${signal.quality_score}) ──`);
 
-    const existingPos = openHLPositions[signal.asset_symbol];
+    // DB record is the authoritative check — does not depend on HL API reliability
+    const dbRecord = openDBRecords[signal.asset_symbol];
 
     // No open position for this asset — open freely
-    if (!existingPos) {
+    if (!dbRecord) {
       try {
         const execution = await openTrade(exchange, signal, RISK_USD);
         await recordTrade(signal, execution, RISK_USD);
         // Track in memory so subsequent signals in same run don't double-open
-        openHLPositions[signal.asset_symbol] = { side: signal.bias, size: 0 };
+        openDBRecords[signal.asset_symbol] = { bias: signal.bias };
         opened++;
       } catch (e) {
         console.error(`[hl-trader] ✗ Skipped ${signal.asset_symbol}: ${e.message}`);
@@ -441,14 +453,21 @@ async function main() {
     }
 
     // Same direction — already in this trade
-    if (existingPos.side === signal.bias) {
-      console.log(`[hl-trader] ⊘ Skipping — already have ${signal.asset_symbol} ${existingPos.side.toUpperCase()} position open`);
+    if (dbRecord.bias === signal.bias) {
+      console.log(`[hl-trader] ⊘ Skipping — already have ${signal.asset_symbol} ${dbRecord.bias.toUpperCase()} position open`);
       skipped++;
       continue;
     }
 
     // Opposite direction — evaluate whether to flip
-    const dbRecord = openDBRecords[signal.asset_symbol];
+    // Use HL live data for P&L if available, fall back to DB entry price
+    const hlPos = openHLPositions[signal.asset_symbol];
+    const existingPos = hlPos ?? {
+      side: dbRecord.bias,
+      entryPrice: parseFloat(dbRecord.actual_entry_price ?? 0),
+      markPrice: null,
+      percentage: null,
+    };
     const currentPrice = existingPos.markPrice ?? existingPos.entryPrice;
     const { close, reason } = evaluateFlip(existingPos, dbRecord, signal, currentPrice);
 
@@ -466,7 +485,7 @@ async function main() {
       await sleep(1000);
       const execution = await openTrade(exchange, signal, RISK_USD);
       await recordTrade(signal, execution, RISK_USD);
-      openHLPositions[signal.asset_symbol] = { side: signal.bias, size: 0 };
+      openDBRecords[signal.asset_symbol] = { bias: signal.bias };
       opened++;
     } catch (e) {
       console.error(`[hl-trader] ✗ Flip failed for ${signal.asset_symbol}: ${e.message}`);
