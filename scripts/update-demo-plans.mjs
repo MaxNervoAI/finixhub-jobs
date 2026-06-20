@@ -36,17 +36,18 @@ async function fetchBinanceTicker(symbol) {
 }
 
 async function fetchBinanceHistoricalPrice(symbol) {
+    // limit=3 → data[0] = 2 days ago close, data[1] = yesterday close, data[2] = today (may be open)
     const urls = [
-        `https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=1d&limit=2`,
-        `https://api.binance.us/api/v3/klines?symbol=${symbol}USDT&interval=1d&limit=2`,
+        `https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=1d&limit=3`,
+        `https://api.binance.us/api/v3/klines?symbol=${symbol}USDT&interval=1d&limit=3`,
     ];
     for (const url of urls) {
         try {
             const res = await fetch(url, { headers: { Accept: 'application/json' } });
             if (!res.ok) { console.warn(`  ${url} → HTTP ${res.status}`); continue; }
             const data = await res.json();
-            if (!Array.isArray(data) || data.length < 2) { console.warn(`  ${url} → invalid body`); continue; }
-            return parseFloat(data[1][4]); // previous day's close
+            if (!Array.isArray(data) || data.length < 3) { console.warn(`  ${url} → invalid body`); continue; }
+            return parseFloat(data[0][4]); // close from 2 days ago
         } catch (err) {
             console.warn(`  ${url} → ${err.message}`);
         }
@@ -167,10 +168,18 @@ async function run() {
             bias = currentPrice >= entry ? 'bullish' : 'bearish';
         }
 
-        const slDistance = entry * 0.05;
-        const tpDistance = entry * 0.15;
-        const invalidation = parseFloat((bias === 'bullish' ? entry - slDistance : entry + slDistance).toPrecision(5));
-        const takeProfit = parseFloat((bias === 'bullish' ? entry + tpDistance : entry - tpDistance).toPrecision(5));
+        // Winner TP: always 15% beyond current price so the trade never appears "at target"
+        // Loser SL: midpoint of entry and current so current is guaranteed past SL
+        let invalidation, takeProfit;
+        if (isLoser) {
+            const midpoint = parseFloat(((entry + currentPrice) / 2).toPrecision(5));
+            invalidation = midpoint;
+            takeProfit = parseFloat((bias === 'bullish' ? entry + entry * 0.15 : entry - entry * 0.15).toPrecision(5));
+        } else {
+            const winnerSlDist = entry * 0.06;
+            invalidation = parseFloat((bias === 'bullish' ? entry - winnerSlDist : entry + winnerSlDist).toPrecision(5));
+            takeProfit = parseFloat((bias === 'bullish' ? currentPrice * 1.15 : currentPrice * 0.85).toPrecision(5));
+        }
         const peakPrice = isLoser
             ? entry
             : bias === 'bullish'
