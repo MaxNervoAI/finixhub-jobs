@@ -1,0 +1,38 @@
+name: Hyperliquid Sync Results
+
+on:
+  schedule:
+    # Every 2 hours — checks if any open SL/TP orders have filled and updates the DB
+    - cron: '0 */2 * * *'
+  workflow_dispatch: # Allow manual trigger at any time
+
+jobs:
+  sync:
+    name: Sync HL trade outcomes to DB
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run sync
+        run: node scripts/hl-sync-results.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          HL_WALLET_ADDRESS: ${{ secrets.HL_WALLET_ADDRESS }}
+          HL_PRIVATE_KEY: ${{ secrets.HL_PRIVATE_KEY }}
+          HL_TESTNET: ${{ secrets.HL_TESTNET }}
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Hyperliquid sync results failed"
