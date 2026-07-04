@@ -63,6 +63,34 @@ function calcPositionSize(riskUsd, entryPrice, slPrice, amtPrecision) {
   return round(rawSize, decimals);
 }
 
+// ── Market entry with one retry ───────────────────────────────────────────────
+// A market entry can be rejected outright with zero fill if there's no
+// resting liquidity to match against at that instant (seen on testnet). One
+// retry, re-pricing off a fresh ticker rather than the stale signal price,
+// is usually enough to catch a momentary liquidity gap without adding
+// meaningful staleness risk to the entry.
+const ENTRY_ATTEMPTS = 2;
+const ENTRY_RETRY_DELAY_MS = 3000;
+
+async function placeMarketEntry(exchange, symbol, side, posSize, referencePrice) {
+  let lastErr;
+  for (let attempt = 1; attempt <= ENTRY_ATTEMPTS; attempt++) {
+    try {
+      const price = attempt === 1 ? referencePrice : (await exchange.fetchTicker(symbol)).last;
+      const order = await exchange.createOrder(symbol, "market", side, posSize, price, {
+        slippagePercentage: 5,
+      });
+      if (attempt > 1) console.log(`[hl-trader] ✓ Entry filled on retry ${attempt}/${ENTRY_ATTEMPTS}`);
+      return order;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[hl-trader] Entry attempt ${attempt}/${ENTRY_ATTEMPTS} failed: ${e.message}`);
+      if (attempt < ENTRY_ATTEMPTS) await sleep(ENTRY_RETRY_DELAY_MS);
+    }
+  }
+  throw lastErr;
+}
+
 // ── Assets with an already-open DB record — the ONLY conflict check ──────────
 // The DB is the single source of truth here on purpose: it's what the rest of
 // the app reads, and it's guaranteed consistent as long as hl-sync-results.mjs
@@ -131,9 +159,7 @@ async function openTrade(exchange, signal, riskUsd) {
   }
 
   // ── 1. Market entry ────────────────────────────────────────────────────────
-  const mainOrder = await exchange.createOrder(symbol, "market", side, posSize, entryPrice, {
-    slippagePercentage: 5,
-  });
+  const mainOrder = await placeMarketEntry(exchange, symbol, side, posSize, entryPrice);
   console.log(`[hl-trader] ✓ Market entry | id:${mainOrder.id}`);
 
   const actualEntry = mainOrder.average ?? mainOrder.info?.average ?? entryPrice;
