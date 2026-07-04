@@ -36,6 +36,33 @@ function orderStatus(order) {
   return "open";
 }
 
+// ── Reconstruct the real closing fill from account trade history ─────────────
+// Used when the SL/TP order objects are gone (unknownOid) so we can't read
+// their fill price directly. Returns null if no matching closing fill is found
+// — callers must NOT fabricate a P&L number in that case.
+async function reconstructExitFromTrades(exchange, trade, symbol) {
+  const since = trade.created_at ? new Date(trade.created_at).getTime() : undefined;
+  const closingSide = trade.bias === "long" ? "sell" : "buy";
+
+  try {
+    const myTrades = await exchange.fetchMyTrades(symbol, since);
+    const closingFills = (myTrades ?? []).filter(
+      (t) => t.side === closingSide && (since == null || t.timestamp >= since)
+    );
+    if (!closingFills.length) return null;
+
+    const totalQty = closingFills.reduce((s, t) => s + t.amount, 0);
+    const notional = closingFills.reduce((s, t) => s + t.amount * t.price, 0);
+    if (totalQty <= 0) return null;
+
+    const lastTs = Math.max(...closingFills.map((t) => t.timestamp));
+    return { exitPrice: notional / totalQty, closedAt: new Date(lastTs).toISOString() };
+  } catch (e) {
+    console.warn(`[hl-sync] Could not reconstruct exit via trade history: ${e.message}`);
+    return null;
+  }
+}
+
 // ── Check one open trade ──────────────────────────────────────────────────────
 async function checkTrade(exchange, trade) {
   const symbol = HL_SYMBOL[trade.asset_symbol];
@@ -73,18 +100,60 @@ async function checkTrade(exchange, trade) {
 
   // If neither order filled yet, check if position is still open
   if (!tpFilled && !slFilled) {
-    // Double-check via open positions
+    let positionExists = true;
     try {
       const positions = await exchange.fetchPositions([symbol]);
-      const pos = positions.find(
-        (p) => p.symbol === symbol && p.contracts > 0
-      );
-      if (!pos) {
-        // Position closed but no order marked filled — probably closed manually
-        console.log(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: position not found, may be manually closed`);
-      }
-    } catch (_) { /* ignore */ }
-    return null; // Still open
+      positionExists = positions.some((p) => p.symbol === symbol && Math.abs(p.contracts ?? 0) > 0);
+    } catch (e) {
+      // Couldn't verify — don't guess, treat as genuinely still open
+      console.warn(`[hl-sync] Could not check positions for ${trade.asset_symbol}: ${e.message}`);
+      return null;
+    }
+
+    if (positionExists) return null; // genuinely still open
+
+    // Position is gone but neither SL nor TP order shows filled (both orders
+    // are likely stale/unknownOid). Try to recover the real exit fill from
+    // trade history so the recorded numbers stay accurate.
+    console.log(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: position not found on HL — reconciling closed trade`);
+    const reconstructed = await reconstructExitFromTrades(exchange, trade, symbol);
+
+    if (reconstructed && trade.actual_entry_price && trade.position_size_contracts) {
+      const { exitPrice, closedAt } = reconstructed;
+      const priceDiff = isLong
+        ? exitPrice - trade.actual_entry_price
+        : trade.actual_entry_price - exitPrice;
+      const actualPnlUsd = priceDiff * trade.position_size_contracts;
+      const actualR = trade.risk_usd ? actualPnlUsd / trade.risk_usd : null;
+      const daysHeld = trade.created_at
+        ? (new Date(closedAt).getTime() - new Date(trade.created_at).getTime()) / (1000 * 60 * 60 * 24)
+        : null;
+
+      return {
+        outcome: actualPnlUsd >= 0 ? "winner" : "loser",
+        actual_exit_price: exitPrice,
+        actual_pnl_usd: parseFloat(actualPnlUsd.toFixed(2)),
+        actual_r: actualR != null ? parseFloat(actualR.toFixed(3)) : null,
+        closed_at: closedAt,
+        days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
+      };
+    }
+
+    // Position is gone and we have no fill data to reconstruct real P&L.
+    // Do NOT guess a number — mark it closed_unresolved so it stops blocking
+    // new trades on this asset, and flag it clearly for manual review.
+    console.warn(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: no trade history found — marking closed_unresolved (needs manual review)`);
+    const daysHeld = trade.created_at
+      ? (Date.now() - new Date(trade.created_at).getTime()) / (1000 * 60 * 60 * 24)
+      : null;
+    return {
+      outcome: "closed_unresolved",
+      actual_exit_price: null,
+      actual_pnl_usd: null,
+      actual_r: null,
+      closed_at: new Date().toISOString(),
+      days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
+    };
   }
 
   // Determine winner/loser
