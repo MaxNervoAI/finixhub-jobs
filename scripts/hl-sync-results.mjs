@@ -98,27 +98,18 @@ async function checkTrade(exchange, trade) {
   const tpFilled = orderStatus(tpOrder) === "filled";
   const slFilled = orderStatus(slOrder) === "filled";
 
-  // If neither order filled yet, check if position is still open
+  // If neither order explicitly shows filled, only a REAL matched closing
+  // fill (from account trade history) can prove the trade is closed.
+  // `fetchPositions` returning empty is NOT used as evidence here — it gave
+  // a false negative once already (reported a genuinely still-open testnet
+  // position as gone), which caused hl-signal-trader.mjs to open a duplicate
+  // position on top of a live one. Absence of proof must default to "still
+  // open", never to "closed".
   if (!tpFilled && !slFilled) {
-    let positionExists = true;
-    try {
-      const positions = await exchange.fetchPositions([symbol]);
-      positionExists = positions.some((p) => p.symbol === symbol && Math.abs(p.contracts ?? 0) > 0);
-    } catch (e) {
-      // Couldn't verify — don't guess, treat as genuinely still open
-      console.warn(`[hl-sync] Could not check positions for ${trade.asset_symbol}: ${e.message}`);
-      return null;
-    }
-
-    if (positionExists) return null; // genuinely still open
-
-    // Position is gone but neither SL nor TP order shows filled (both orders
-    // are likely stale/unknownOid). Try to recover the real exit fill from
-    // trade history so the recorded numbers stay accurate.
-    console.log(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: position not found on HL — reconciling closed trade`);
     const reconstructed = await reconstructExitFromTrades(exchange, trade, symbol);
 
     if (reconstructed && trade.actual_entry_price && trade.position_size_contracts) {
+      console.log(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: found closing fill in trade history — reconciling`);
       const { exitPrice, closedAt } = reconstructed;
       const priceDiff = isLong
         ? exitPrice - trade.actual_entry_price
@@ -139,21 +130,18 @@ async function checkTrade(exchange, trade) {
       };
     }
 
-    // Position is gone and we have no fill data to reconstruct real P&L.
-    // Do NOT guess a number — mark it closed_unresolved so it stops blocking
-    // new trades on this asset, and flag it clearly for manual review.
-    console.warn(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: no trade history found — marking closed_unresolved (needs manual review)`);
-    const daysHeld = trade.created_at
-      ? (Date.now() - new Date(trade.created_at).getTime()) / (1000 * 60 * 60 * 24)
-      : null;
-    return {
-      outcome: "closed_unresolved",
-      actual_exit_price: null,
-      actual_pnl_usd: null,
-      actual_r: null,
-      closed_at: new Date().toISOString(),
-      days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
-    };
+    // No positive proof of closure. It's fine to also note what
+    // fetchPositions thinks, purely for visibility — but it must NOT change
+    // the outcome. Still open until proven otherwise.
+    try {
+      const positions = await exchange.fetchPositions([symbol]);
+      const positionExists = positions.some((p) => p.symbol === symbol && Math.abs(p.contracts ?? 0) > 0);
+      if (!positionExists) {
+        console.warn(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: fetchPositions reports no position, but no closing fill found in trade history either — leaving as OPEN and flagging for manual review (do not trust fetchPositions alone)`);
+      }
+    } catch (_) { /* purely informational, ignore failures */ }
+
+    return null; // still open
   }
 
   // Determine winner/loser
