@@ -71,12 +71,27 @@ function calcPositionSize(riskUsd, entryPrice, slPrice, amtPrecision) {
 // meaningful staleness risk to the entry.
 const ENTRY_ATTEMPTS = 2;
 const ENTRY_RETRY_DELAY_MS = 3000;
+// If price has moved more than this from the original signal price by the
+// time of the retry, the setup the quality score was computed for no longer
+// holds — better to miss the trade than chase it at a level the signal never
+// justified. (Seen live: a retry chased ETH 6.6% away from signal price.)
+const ENTRY_MAX_DEVIATION_PCT = 1.5;
 
 async function placeMarketEntry(exchange, symbol, side, posSize, referencePrice) {
   let lastErr;
   for (let attempt = 1; attempt <= ENTRY_ATTEMPTS; attempt++) {
     try {
-      const price = attempt === 1 ? referencePrice : (await exchange.fetchTicker(symbol)).last;
+      let price = referencePrice;
+      if (attempt > 1) {
+        price = (await exchange.fetchTicker(symbol)).last;
+        const deviationPct = Math.abs(price - referencePrice) / referencePrice * 100;
+        if (deviationPct > ENTRY_MAX_DEVIATION_PCT) {
+          throw new Error(
+            `Price moved ${deviationPct.toFixed(2)}% from signal ($${referencePrice} → $${price}), ` +
+            `exceeding ${ENTRY_MAX_DEVIATION_PCT}% max deviation — signal is stale, not chasing`
+          );
+        }
+      }
       const order = await exchange.createOrder(symbol, "market", side, posSize, price, {
         slippagePercentage: 5,
       });
