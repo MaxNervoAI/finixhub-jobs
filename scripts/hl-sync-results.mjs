@@ -135,6 +135,11 @@ async function checkTrade(exchange, trade) {
         actual_r: actualR != null ? parseFloat(actualR.toFixed(3)) : null,
         closed_at: closedAt,
         days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
+        // Can't tell from trade history alone whether this was the SL, the
+        // TP, or a manual/flip close that hl-signal-trader.mjs didn't record
+        // itself — 'manual' just means "closed by something other than a
+        // bracket order filling, cause unknown".
+        close_reason: "manual",
       };
     }
 
@@ -183,6 +188,7 @@ async function checkTrade(exchange, trade) {
     actual_r: actualR ? parseFloat(actualR.toFixed(3)) : null,
     closed_at: closedAt,
     days_held: daysHeld ? parseFloat(daysHeld.toFixed(2)) : null,
+    close_reason: tpFilled ? "take_profit" : "stop_loss",
   };
 }
 
