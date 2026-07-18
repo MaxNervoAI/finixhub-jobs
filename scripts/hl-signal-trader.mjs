@@ -6,13 +6,22 @@
  * in the hyperliquid_trades table for comparison with paper trading.
  *
  * Filter: source=live, scoring_version=v2, method_alignment=true, quality_score>=70, final_status=pending
+ * Assets: BTC, ETH only. SOL is intentionally excluded — backtesting
+ * (2026-05-23 to 2026-07-18) showed SOL needing up to 9x concurrent capital
+ * to capture meaningfully more R than BTC/ETH ever needed at 2x, i.e. much
+ * worse capital efficiency. Revisit if SOL's behavior changes.
  *
- * Position policy (kept intentionally simple for reliability):
- *   - No open DB record for the asset → open freely.
- *   - An open DB record already exists for the asset → skip entirely. Never
- *     modify, upgrade, flip, or cancel anything on an existing position. The
- *     only thing that closes a position is its own SL/TP order filling, or
- *     hl-sync-results.mjs reconciling it after the fact.
+ * Position policy, backtested against the same window before adopting:
+ *   - No open position for the asset+direction → open freely, up to
+ *     MAX_SAME_DIRECTION concurrent tranches per asset+direction.
+ *   - MAX_SAME_DIRECTION reached for that asset+direction → skip.
+ *   - An open position exists in the OPPOSITE direction → flip: cancel its
+ *     resting SL/TP orders, close it at market, record the realized result
+ *     (close_reason='flip'), then open the new signal. Backtest: of 10 flip
+ *     events, 7 rescued what would've been a full -1R stop-out, 3 cut a
+ *     winner short — net positive every time relative to doing nothing.
+ *   - hl-sync-results.mjs remains the source of truth for trades that close
+ *     via their own SL/TP order filling (this script never touches those).
  *
  * Usage:
  *   node scripts/hl-signal-trader.mjs            # process new signals
@@ -31,6 +40,7 @@ const PRIVATE_KEY = process.env.HL_PRIVATE_KEY;
 const TESTNET = process.env.HL_TESTNET !== "false";
 const RISK_USD = parseFloat(process.env.HL_RISK_PER_TRADE_USD ?? "15");
 const MIN_QUALITY = 70;
+const MAX_SAME_DIRECTION = 2;
 const DRY_RUN = process.argv.includes("--dry-run");
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -44,8 +54,9 @@ if (!WALLET_ADDRESS || !PRIVATE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ── Symbol mapping ────────────────────────────────────────────────────────────
-const HL_SYMBOL = { BTC: "BTC/USDC:USDC", ETH: "ETH/USDC:USDC", SOL: "SOL/USDC:USDC" };
+// ── Symbol mapping — BTC/ETH only, SOL excluded (see header) ─────────────────
+const HL_SYMBOL = { BTC: "BTC/USDC:USDC", ETH: "ETH/USDC:USDC" };
+const TRADED_ASSETS = Object.keys(HL_SYMBOL);
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -106,17 +117,100 @@ async function placeMarketEntry(exchange, symbol, side, posSize, referencePrice)
   throw lastErr;
 }
 
-// ── Assets with an already-open DB record — the ONLY conflict check ──────────
+// ── Fetch this run's open positions, grouped by asset ─────────────────────────
 // The DB is the single source of truth here on purpose: it's what the rest of
 // the app reads, and it's guaranteed consistent as long as hl-sync-results.mjs
 // keeps it that way. No live HL position lookup is needed to make this decision.
-async function fetchBusyAssets() {
+async function fetchOpenPositionsByAsset() {
   const { data } = await supabase
     .from("hyperliquid_trades")
-    .select("asset_symbol")
+    .select("id, asset_symbol, bias, hl_tp_order_id, hl_sl_order_id, actual_entry_price, position_size_contracts, risk_usd, created_at, opportunity_id")
     .eq("outcome", "open")
     .eq("environment", TESTNET ? "testnet" : "mainnet");
-  return new Set((data ?? []).map((r) => r.asset_symbol));
+
+  const byAsset = {};
+  for (const row of data ?? []) {
+    (byAsset[row.asset_symbol] ??= []).push(row);
+  }
+  return byAsset;
+}
+
+// ── Fetch paper trading result for comparison (mirrors hl-sync-results.mjs) ──
+async function fetchPaperResult(opportunityId) {
+  if (!opportunityId) return {};
+  const { data } = await supabase
+    .from("opportunity_performance")
+    .select("final_status, risk_reward_ratio")
+    .eq("id", opportunityId)
+    .single();
+  if (!data) return {};
+  const paperR = data.final_status === "winner"
+    ? parseFloat(data.risk_reward_ratio ?? 0)
+    : data.final_status === "loser" ? -1 : null;
+  return { paper_outcome: data.final_status, paper_r: paperR };
+}
+
+// ── Close an existing position at market because a new opposite-direction ────
+// signal arrived. Cancels its resting SL/TP first so they can't fill against
+// the market close (or the newly-opened opposite position) as an orphaned
+// order, then records the realized result with close_reason='flip'.
+async function flipClosePosition(exchange, position) {
+  const symbol = HL_SYMBOL[position.asset_symbol];
+  const isLong = position.bias === "long";
+  const closeSide = isLong ? "sell" : "buy";
+
+  console.log(`[hl-trader] ⇄ Flip: closing existing ${position.asset_symbol} ${position.bias.toUpperCase()} (opened ${position.created_at})`);
+
+  if (DRY_RUN) {
+    console.log(`[hl-trader] DRY RUN — would cancel SL/TP and close at market`);
+    return;
+  }
+
+  for (const orderId of [position.hl_tp_order_id, position.hl_sl_order_id]) {
+    if (!orderId) continue;
+    try {
+      await exchange.cancelOrder(orderId, symbol);
+      await sleep(200);
+    } catch (e) {
+      console.warn(`[hl-trader] Could not cancel order ${orderId} (may already be filled/gone): ${e.message}`);
+    }
+  }
+
+  const referencePrice = (await exchange.fetchTicker(symbol)).last;
+  const closeOrder = await exchange.createOrder(symbol, "market", closeSide, position.position_size_contracts, referencePrice, {
+    reduceOnly: true,
+    slippagePercentage: 5,
+  });
+  const exitPrice = closeOrder.average ?? referencePrice;
+  console.log(`[hl-trader] ✓ Flip-closed at $${exitPrice}`);
+
+  const entry = parseFloat(position.actual_entry_price);
+  const priceDiff = isLong ? exitPrice - entry : entry - exitPrice;
+  const actualPnlUsd = priceDiff * position.position_size_contracts;
+  const actualR = position.risk_usd ? actualPnlUsd / position.risk_usd : null;
+  const daysHeld = position.created_at
+    ? (Date.now() - new Date(position.created_at).getTime()) / (1000 * 60 * 60 * 24)
+    : null;
+
+  const paper = await fetchPaperResult(position.opportunity_id);
+
+  const { error } = await supabase
+    .from("hyperliquid_trades")
+    .update({
+      outcome: actualPnlUsd >= 0 ? "winner" : "loser",
+      actual_exit_price: exitPrice,
+      actual_pnl_usd: parseFloat(actualPnlUsd.toFixed(2)),
+      actual_r: actualR != null ? parseFloat(actualR.toFixed(3)) : null,
+      closed_at: new Date().toISOString(),
+      days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
+      close_reason: "flip",
+      ...paper,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", position.id);
+
+  if (error) console.error(`[hl-trader] Failed to record flip-close for ${position.id}: ${error.message}`);
+  else console.log(`[hl-trader] ✓ Recorded flip-close | R:${actualR != null ? actualR.toFixed(2) : "n/a"}`);
 }
 
 // ── Fetch signals not yet traded on HL ───────────────────────────────────────
@@ -128,6 +222,7 @@ async function fetchNewSignals() {
     .eq("scoring_version", "v2")
     .eq("final_status", "pending")
     .eq("method_alignment", true)
+    .in("asset_symbol", TRADED_ASSETS)
     .gte("quality_score", MIN_QUALITY)
     .order("quality_score", { ascending: false });
 
@@ -263,7 +358,8 @@ async function recordTrade(signal, execution, riskUsd) {
 async function main() {
   console.log(`\n[hl-trader] ══════════════════════════════════════`);
   console.log(`[hl-trader] Hyperliquid Signal Trader ${DRY_RUN ? "(DRY RUN)" : ""}`);
-  console.log(`[hl-trader] Filter: aligned=true, quality>=${MIN_QUALITY}, status=pending`);
+  console.log(`[hl-trader] Filter: aligned=true, quality>=${MIN_QUALITY}, status=pending, assets=${TRADED_ASSETS.join("/")}`);
+  console.log(`[hl-trader] Policy: max ${MAX_SAME_DIRECTION} same-direction tranches/asset, flip on opposite-direction signal`);
   console.log(`[hl-trader] Risk per trade: $${RISK_USD} | ${TESTNET ? "TESTNET" : "MAINNET"}`);
   console.log(`[hl-trader] ══════════════════════════════════════\n`);
 
@@ -274,13 +370,19 @@ async function main() {
   });
   await exchange.loadMarkets();
 
-  const [signals, busyAssets] = await Promise.all([
+  const [signals, openByAsset] = await Promise.all([
     fetchNewSignals(),
-    fetchBusyAssets(),
+    fetchOpenPositionsByAsset(),
   ]);
 
   console.log(`[hl-trader] Found ${signals.length} new signal(s) to process.`);
-  console.log(`[hl-trader] Assets already open (untouched): ${busyAssets.size > 0 ? [...busyAssets].join(", ") : "none"}\n`);
+  for (const asset of TRADED_ASSETS) {
+    const open = openByAsset[asset] ?? [];
+    if (open.length) {
+      console.log(`[hl-trader] ${asset} currently open: ${open.map((p) => p.bias).join(", ")}`);
+    }
+  }
+  console.log("");
 
   if (signals.length === 0) {
     console.log("[hl-trader] Nothing to do. Run again after the next scanner cycle.");
@@ -302,21 +404,36 @@ async function main() {
   }
 
   let opened = 0;
+  let flipped = 0;
   let skipped = 0;
 
   for (const signal of dedupedSignals) {
     console.log(`[hl-trader] ── Processing ${signal.asset_symbol} ${signal.bias.toUpperCase()} (quality:${signal.quality_score}) ──`);
 
-    if (busyAssets.has(signal.asset_symbol)) {
-      console.log(`[hl-trader] ⊘ Skipping — ${signal.asset_symbol} already has an open position. Not touching it.`);
-      skipped++;
-      continue;
-    }
+    const openPositions = openByAsset[signal.asset_symbol] ?? [];
+    const sameDirection = openPositions.filter((p) => p.bias === signal.bias);
+    const oppositeDirection = openPositions.filter((p) => p.bias !== signal.bias);
 
     try {
+      if (oppositeDirection.length > 0) {
+        for (const pos of oppositeDirection) {
+          await flipClosePosition(exchange, pos);
+          flipped++;
+          await sleep(500);
+        }
+      } else if (sameDirection.length >= MAX_SAME_DIRECTION) {
+        console.log(`[hl-trader] ⊘ Skipping — ${signal.asset_symbol} already has ${sameDirection.length}/${MAX_SAME_DIRECTION} ${signal.bias} tranches open.`);
+        skipped++;
+        continue;
+      }
+
       const execution = await openTrade(exchange, signal, RISK_USD);
       await recordTrade(signal, execution, RISK_USD);
-      busyAssets.add(signal.asset_symbol); // don't double-open within the same run
+      // Keep in-memory state consistent in case another signal this run targets the same asset
+      (openByAsset[signal.asset_symbol] ??= []).push({
+        asset_symbol: signal.asset_symbol,
+        bias: signal.bias,
+      });
       opened++;
     } catch (e) {
       console.error(`[hl-trader] ✗ Skipped ${signal.asset_symbol}: ${e.message}`);
@@ -325,7 +442,7 @@ async function main() {
     await sleep(1000);
   }
 
-  console.log(`\n[hl-trader] Done. Opened: ${opened} | Skipped: ${skipped}`);
+  console.log(`\n[hl-trader] Done. Opened: ${opened} | Flipped: ${flipped} | Skipped: ${skipped}`);
 }
 
 main().catch((err) => {

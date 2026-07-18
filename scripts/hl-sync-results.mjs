@@ -45,7 +45,15 @@ async function reconstructExitFromTrades(exchange, trade, symbol) {
   const closingSide = trade.bias === "long" ? "sell" : "buy";
 
   try {
-    const myTrades = await exchange.fetchMyTrades(symbol, since);
+    // Fetch without `since` — Hyperliquid's time-bounded fills endpoint
+    // (userFillsByTime, used when `since` is passed) has proven unreliable;
+    // the default fills endpoint (userFills, last ~2000 fills) is the
+    // battle-tested path. Filter by time/side ourselves instead.
+    const myTrades = await exchange.fetchMyTrades(symbol);
+    console.log(
+      `[hl-sync] ${trade.asset_symbol} ${trade.bias}: fetched ${myTrades?.length ?? 0} raw fill(s) for symbol, ` +
+      `sides seen: ${[...new Set((myTrades ?? []).map((t) => t.side))].join(",") || "none"}`
+    );
     const closingFills = (myTrades ?? []).filter(
       (t) => t.side === closingSide && (since == null || t.timestamp >= since)
     );
@@ -127,6 +135,11 @@ async function checkTrade(exchange, trade) {
         actual_r: actualR != null ? parseFloat(actualR.toFixed(3)) : null,
         closed_at: closedAt,
         days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
+        // Can't tell from trade history alone whether this was the SL, the
+        // TP, or a manual/flip close that hl-signal-trader.mjs didn't record
+        // itself — 'manual' just means "closed by something other than a
+        // bracket order filling, cause unknown".
+        close_reason: "manual",
       };
     }
 
@@ -175,6 +188,7 @@ async function checkTrade(exchange, trade) {
     actual_r: actualR ? parseFloat(actualR.toFixed(3)) : null,
     closed_at: closedAt,
     days_held: daysHeld ? parseFloat(daysHeld.toFixed(2)) : null,
+    close_reason: tpFilled ? "take_profit" : "stop_loss",
   };
 }
 
