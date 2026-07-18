@@ -45,7 +45,15 @@ async function reconstructExitFromTrades(exchange, trade, symbol) {
   const closingSide = trade.bias === "long" ? "sell" : "buy";
 
   try {
-    const myTrades = await exchange.fetchMyTrades(symbol, since);
+    // Fetch without `since` — Hyperliquid's time-bounded fills endpoint
+    // (userFillsByTime, used when `since` is passed) has proven unreliable;
+    // the default fills endpoint (userFills, last ~2000 fills) is the
+    // battle-tested path. Filter by time/side ourselves instead.
+    const myTrades = await exchange.fetchMyTrades(symbol);
+    console.log(
+      `[hl-sync] ${trade.asset_symbol} ${trade.bias}: fetched ${myTrades?.length ?? 0} raw fill(s) for symbol, ` +
+      `sides seen: ${[...new Set((myTrades ?? []).map((t) => t.side))].join(",") || "none"}`
+    );
     const closingFills = (myTrades ?? []).filter(
       (t) => t.side === closingSide && (since == null || t.timestamp >= since)
     );
