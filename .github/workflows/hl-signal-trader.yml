@@ -1,10 +1,15 @@
 name: Hyperliquid Signal Trader
 
 on:
+  # Primary trigger: fires within seconds of the scanner finishing, instead of
+  # a fixed cron offset that GitHub Actions can delay by hours under load.
+  workflow_run:
+    workflows: ["AI Trade Opportunity Scanner"]
+    types: [completed]
+  # Safety net: catches anything missed if the workflow_run trigger doesn't
+  # fire (e.g. the scanner run itself fails) or a signal needs a second look.
   schedule:
-    # 10 min after the trade scanner fires (scanner runs at 0:00 and 12:00 UTC)
-    # Paper trading signals should be ready by then, live trading follows immediately
-    - cron: '10 0,12 * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch: # Allow manual trigger at any time
 
 jobs:
@@ -12,6 +17,10 @@ jobs:
     name: Open HL trades for new aligned signals
     runs-on: ubuntu-latest
     timeout-minutes: 10  # market orders fill immediately + SL/TP placement
+    # Don't trade off a scanner run that failed — only proceed if this was
+    # triggered by something other than workflow_run (schedule/dispatch), or
+    # by a workflow_run event whose scanner run actually succeeded.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: Checkout code
