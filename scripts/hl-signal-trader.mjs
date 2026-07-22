@@ -23,6 +23,13 @@
  *   - hl-sync-results.mjs remains the source of truth for trades that close
  *     via their own SL/TP order filling (this script never touches those).
  *
+ * Runs via workflow_run right after the scanner finishes (plus a 30-min
+ * schedule as a safety net) rather than a fixed cron offset — a signal that
+ * resolves fast (paper trading checks every 15 min) can otherwise disappear
+ * before a twice-daily trader ever sees it. Every entry (including the
+ * first attempt, not just retries) is checked against current price before
+ * firing a market order — see ENTRY_MAX_DEVIATION_PCT.
+ *
  * Usage:
  *   node scripts/hl-signal-trader.mjs            # process new signals
  *   node scripts/hl-signal-trader.mjs --dry-run  # log signals without opening trades
@@ -78,31 +85,39 @@ function calcPositionSize(riskUsd, entryPrice, slPrice, amtPrecision) {
 // A market entry can be rejected outright with zero fill if there's no
 // resting liquidity to match against at that instant (seen on testnet). One
 // retry, re-pricing off a fresh ticker rather than the stale signal price,
-// is usually enough to catch a momentary liquidity gap without adding
-// meaningful staleness risk to the entry.
+// is usually enough to catch a momentary liquidity gap.
 const ENTRY_ATTEMPTS = 2;
 const ENTRY_RETRY_DELAY_MS = 3000;
-// If price has moved more than this from the original signal price by the
-// time of the retry, the setup the quality score was computed for no longer
-// holds — better to miss the trade than chase it at a level the signal never
-// justified. (Seen live: a retry chased ETH 6.6% away from signal price.)
+// If current price has moved more than this from the signal's entry_price,
+// the setup the quality score was computed for no longer holds — better to
+// miss the trade than chase it at a level the signal never justified. This
+// is checked on EVERY attempt, including the first: a market order fires
+// immediately regardless of how long the signal has been pending, so a
+// slow-moving pipeline (or just a fast-moving market) can mean the "current
+// price" is already far from what was scored, even within minutes. (Seen
+// live: an 18-minute-old ETH signal filled 2.23% away from its entry_price
+// because the order chased whatever the market was doing right then.)
+// This deviation check is deliberately NOT loosened for fast reactions —
+// a large move is a bad entry whether it happened in 18 minutes or 18
+// seconds, and reacting fast to a genuine volatility spike is exactly when
+// chasing is most dangerous, not least. Skips are logged with the signal's
+// age so this can be tuned later from real data instead of a guess now.
 const ENTRY_MAX_DEVIATION_PCT = 1.5;
 
-async function placeMarketEntry(exchange, symbol, side, posSize, referencePrice) {
+async function placeMarketEntry(exchange, symbol, side, posSize, referencePrice, signalAgeMin) {
   let lastErr;
   for (let attempt = 1; attempt <= ENTRY_ATTEMPTS; attempt++) {
+    const price = (await exchange.fetchTicker(symbol)).last;
+    const deviationPct = Math.abs(price - referencePrice) / referencePrice * 100;
+    if (deviationPct > ENTRY_MAX_DEVIATION_PCT) {
+      // Not retryable — the price won't un-move by waiting a few seconds.
+      throw new Error(
+        `Price moved ${deviationPct.toFixed(2)}% from signal ($${referencePrice} → $${price}), ` +
+        `exceeding ${ENTRY_MAX_DEVIATION_PCT}% max deviation — signal is stale, not chasing ` +
+        `(signal age: ${signalAgeMin != null ? signalAgeMin.toFixed(1) + "min" : "unknown"})`
+      );
+    }
     try {
-      let price = referencePrice;
-      if (attempt > 1) {
-        price = (await exchange.fetchTicker(symbol)).last;
-        const deviationPct = Math.abs(price - referencePrice) / referencePrice * 100;
-        if (deviationPct > ENTRY_MAX_DEVIATION_PCT) {
-          throw new Error(
-            `Price moved ${deviationPct.toFixed(2)}% from signal ($${referencePrice} → $${price}), ` +
-            `exceeding ${ENTRY_MAX_DEVIATION_PCT}% max deviation — signal is stale, not chasing`
-          );
-        }
-      }
       const order = await exchange.createOrder(symbol, "market", side, posSize, price, {
         slippagePercentage: 5,
       });
@@ -217,7 +232,7 @@ async function flipClosePosition(exchange, position) {
 async function fetchNewSignals() {
   const { data: signals, error } = await supabase
     .from("opportunity_performance")
-    .select("id, asset_symbol, bias, entry_price, invalidation_level, take_profit_levels, quality_score, risk_reward_ratio, method_alignment, simulation_date")
+    .select("id, asset_symbol, bias, entry_price, invalidation_level, take_profit_levels, quality_score, risk_reward_ratio, method_alignment, simulation_date, created_at")
     .eq("source", "live")
     .eq("scoring_version", "v2")
     .eq("final_status", "pending")
@@ -269,7 +284,10 @@ async function openTrade(exchange, signal, riskUsd) {
   }
 
   // ── 1. Market entry ────────────────────────────────────────────────────────
-  const mainOrder = await placeMarketEntry(exchange, symbol, side, posSize, entryPrice);
+  const signalAgeMin = signal.created_at
+    ? (Date.now() - new Date(signal.created_at).getTime()) / (1000 * 60)
+    : null;
+  const mainOrder = await placeMarketEntry(exchange, symbol, side, posSize, entryPrice, signalAgeMin);
   console.log(`[hl-trader] ✓ Market entry | id:${mainOrder.id}`);
 
   const actualEntry = mainOrder.average ?? mainOrder.info?.average ?? entryPrice;
