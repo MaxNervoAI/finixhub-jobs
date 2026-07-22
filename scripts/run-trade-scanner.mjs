@@ -537,9 +537,21 @@ async function main() {
       final_status: "pending",
     }));
 
+    // Conflict target is opportunity_id, not (source, simulation_date,
+    // asset_symbol, bias, scoring_version) — that date-based key used to mean
+    // a second same-day scan for the same asset+direction silently overwrote
+    // the first scan's entry/SL/TP/quality_score in place. Harmless for pure
+    // paper tracking, but once a real Hyperliquid trade links to a row's id
+    // (hyperliquid_trades.opportunity_id), overwriting it silently rewrites
+    // what that live trade is compared against to a completely different,
+    // unrelated signal. Confirmed happening in production (2026-07-22) for
+    // two live trades. opportunity_id is unique per row already (every scan
+    // inserts a fresh trade_opportunities row above), so this upsert now only
+    // ever guards against a literal duplicate resubmission — every scan's
+    // assessment gets its own permanent row.
     const { error: perfError } = await supabase
       .from("opportunity_performance")
-      .upsert(perfRows, { onConflict: "source,simulation_date,asset_symbol,bias,scoring_version" });
+      .upsert(perfRows, { onConflict: "opportunity_id" });
 
     if (perfError) {
       // Non-fatal: log but don't abort — opportunities are still stored
