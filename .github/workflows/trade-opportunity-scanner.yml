@@ -1,9 +1,12 @@
 name: AI Trade Opportunity Scanner
 
 on:
-  schedule:
-    - cron: '0 */12 * * *' # Every 12 hours
-  workflow_dispatch: # Allow manual trigger
+  # Triggered by Supabase pg_cron (dispatch-trade-scanner edge function) via
+  # the GitHub API every 12h, not GitHub's own `schedule:` trigger — that was
+  # observed delaying by 2-3.5 hours under load, which cascaded into stale
+  # signals and missed trades downstream. See supabase/migrations in the
+  # main finixhub repo (schedule_trade_scanner_dispatch) for the pg_cron job.
+  workflow_dispatch: # Allow manual trigger (also what pg_cron calls)
 
 jobs:
   check:
