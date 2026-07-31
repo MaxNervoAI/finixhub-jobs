@@ -12,6 +12,16 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch: # Allow manual trigger at any time
 
+# Serialize runs — workflow_run and the schedule safety-net can fire within
+# seconds of each other, and two concurrent runs both reading "current open
+# positions" before either records its own new trade caused a real duplicate
+# double-open (2026-07-29: same BTC + ETH signals opened twice, one from
+# each overlapping run, blowing past the same-direction cap). Queue instead
+# of running in parallel; never cancel a run mid-trade.
+concurrency:
+  group: hl-signal-trader
+  cancel-in-progress: false
+
 jobs:
   trade:
     name: Open HL trades for new aligned signals

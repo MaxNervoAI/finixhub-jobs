@@ -1,9 +1,16 @@
 name: AI Trade Performance Check
 
 on:
-  schedule:
-    - cron: '0 0 * * *' # Daily at midnight UTC
-  workflow_dispatch: # Allow manual trigger
+  # Dispatched by Supabase pg_cron (dispatch-performance-check edge function)
+  # every ~20 min, not GitHub's own `schedule:` trigger — that ran this job
+  # only once a day, which meant a real Hyperliquid TP fill could sit
+  # unreconciled in the DB for up to 24h (found 2026-07-31: two positions
+  # had already closed profitably ~5.5h earlier with nothing to show it).
+  workflow_dispatch: # Also what pg_cron calls
+
+concurrency:
+  group: performance-check
+  cancel-in-progress: false
 
 jobs:
   check:

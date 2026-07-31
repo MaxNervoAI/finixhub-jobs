@@ -5,6 +5,28 @@
  * When a position closes (TP or SL hit), updates the trade record with
  * actual P&L and compares against the paper trading outcome.
  *
+ * Position-health rules enforced on every run (added 2026-07-31 after a
+ * real incident: two overlapping trader runs opened duplicate positions,
+ * one duplicate pair's TP filled without anyone noticing for ~5.5h since
+ * this job only ran daily, and the filled side's sibling SL order was
+ * never cancelled and sat orphaned on the book):
+ *
+ *   1. On any confirmed fill, cancel the sibling bracket order — a filled
+ *      TP leaves no reason for its SL to keep resting, and vice versa.
+ *   2. Sweep all real open orders for tracked assets and cancel any that
+ *      don't belong to a currently-open DB row — catches orphans left by
+ *      anything that predates rule 1, or any other edge case.
+ *   3. Flag (log only, never auto-act) if two 'open' rows share the same
+ *      opportunity_id — that's a duplicate-open, not a legitimate stack,
+ *      and needs a human look since one side may already be mid-resolution.
+ *   4. Flag (log only) if more same-direction positions are open for an
+ *      asset than the trader's cap allows — should be structurally
+ *      impossible after the hl-signal-trader.yml concurrency fix; seeing
+ *      it means something else broke.
+ *   5. Flag (log only) partial fills (filled > 0 and remaining > 0) — this
+ *      system has no partial-position accounting, so a partial fill is
+ *      surfaced for visibility rather than silently mishandled.
+ *
  * Usage: node scripts/hl-sync-results.mjs
  */
 
@@ -25,6 +47,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !WALLET_ADDRESS || !PRIVATE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const HL_SYMBOL = { BTC: "BTC/USDC:USDC", ETH: "ETH/USDC:USDC", SOL: "SOL/USDC:USDC" };
+const MAX_SAME_DIRECTION = 2; // must match hl-signal-trader.mjs
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -34,6 +57,23 @@ function orderStatus(order) {
   if (order.status === "closed" || order.status === "filled") return "filled";
   if (order.status === "canceled" || order.status === "cancelled" || order.status === "rejected") return "cancelled";
   return "open";
+}
+
+function isPartialFill(order) {
+  return !!order && (order.filled ?? 0) > 0 && (order.remaining ?? 0) > 0;
+}
+
+// ── Cancel an order, tolerating "already gone" (filled/cancelled/unknownOid) ──
+async function safeCancelOrder(exchange, orderId, symbol, label) {
+  if (!orderId) return;
+  try {
+    await exchange.cancelOrder(orderId, symbol);
+    console.log(`[hl-sync] ✓ Cancelled orphaned ${label} order ${orderId}`);
+  } catch (e) {
+    // Already filled, already cancelled, or purged — not an error worth failing over.
+    console.log(`[hl-sync] ${label} order ${orderId} not cancelled (likely already gone): ${e.message}`);
+  }
+  await sleep(200);
 }
 
 // ── Reconstruct the real closing fill from account trade history ─────────────
@@ -103,6 +143,14 @@ async function checkTrade(exchange, trade) {
     console.warn(`[hl-sync] Could not fetch SL order ${trade.hl_sl_order_id}: ${e.message}`);
   }
 
+  // Rule 5: surface partial fills — no attempt to resolve them, just visibility.
+  if (isPartialFill(tpOrder)) {
+    console.warn(`[hl-sync] ⚠ PARTIAL FILL: ${trade.asset_symbol} ${trade.bias} TP order ${trade.hl_tp_order_id} — filled ${tpOrder.filled}/${(tpOrder.filled ?? 0) + (tpOrder.remaining ?? 0)}. Leaving as open; no partial-position accounting exists yet.`);
+  }
+  if (isPartialFill(slOrder)) {
+    console.warn(`[hl-sync] ⚠ PARTIAL FILL: ${trade.asset_symbol} ${trade.bias} SL order ${trade.hl_sl_order_id} — filled ${slOrder.filled}/${(slOrder.filled ?? 0) + (slOrder.remaining ?? 0)}. Leaving as open; no partial-position accounting exists yet.`);
+  }
+
   const tpFilled = orderStatus(tpOrder) === "filled";
   const slFilled = orderStatus(slOrder) === "filled";
 
@@ -127,6 +175,12 @@ async function checkTrade(exchange, trade) {
       const daysHeld = trade.created_at
         ? (new Date(closedAt).getTime() - new Date(trade.created_at).getTime()) / (1000 * 60 * 60 * 24)
         : null;
+
+      // Rule 1: whatever closed this, cancel any bracket orders that are
+      // still resting — neither should still make sense once the position
+      // is gone by some other means.
+      await safeCancelOrder(exchange, trade.hl_tp_order_id, symbol, "TP");
+      await safeCancelOrder(exchange, trade.hl_sl_order_id, symbol, "SL");
 
       return {
         outcome: actualPnlUsd >= 0 ? "winner" : "loser",
@@ -161,6 +215,13 @@ async function checkTrade(exchange, trade) {
   const outcome = tpFilled ? "winner" : "loser";
   const exitOrder = tpFilled ? tpOrder : slOrder;
   const actualExit = exitOrder?.average ?? exitOrder?.price ?? null;
+
+  // Rule 1: cancel the sibling order — it filled, its counterpart no longer protects anything real.
+  if (tpFilled) {
+    await safeCancelOrder(exchange, trade.hl_sl_order_id, symbol, "SL");
+  } else {
+    await safeCancelOrder(exchange, trade.hl_tp_order_id, symbol, "TP");
+  }
 
   // Calculate P&L
   let actualPnlUsd = null;
@@ -217,6 +278,90 @@ function logComparison(trade, result, paper) {
   console.log(`[hl-sync] ${trade.asset_symbol} ${trade.bias.toUpperCase()} CLOSED | ${hlStr} | ${paperStr} | ${match}`);
 }
 
+// ── Rule 3 + 4: structural health checks over whatever is open AFTER syncing ──
+async function runHealthChecks() {
+  const { data: openTrades } = await supabase
+    .from("hyperliquid_trades")
+    .select("id, asset_symbol, bias, opportunity_id, created_at")
+    .eq("outcome", "open")
+    .eq("environment", TESTNET ? "testnet" : "mainnet");
+
+  if (!openTrades?.length) return;
+
+  // Rule 3: duplicate opportunity_id among currently-open rows.
+  const byOpportunity = new Map();
+  for (const t of openTrades) {
+    if (!t.opportunity_id) continue;
+    if (!byOpportunity.has(t.opportunity_id)) byOpportunity.set(t.opportunity_id, []);
+    byOpportunity.get(t.opportunity_id).push(t);
+  }
+  for (const [oppId, rows] of byOpportunity) {
+    if (rows.length > 1) {
+      console.error(
+        `[hl-sync] 🚨 CRITICAL: ${rows.length} open trades share the same opportunity_id (${oppId}) — ` +
+        `this is a duplicate-open, not a legitimate stack. IDs: ${rows.map((r) => r.id).join(", ")}. ` +
+        `Not auto-closing (one side may already be mid-resolution) — needs manual review.`
+      );
+    }
+  }
+
+  // Rule 4: same-direction cap violation.
+  const byAssetBias = new Map();
+  for (const t of openTrades) {
+    const key = `${t.asset_symbol}:${t.bias}`;
+    if (!byAssetBias.has(key)) byAssetBias.set(key, []);
+    byAssetBias.get(key).push(t);
+  }
+  for (const [key, rows] of byAssetBias) {
+    if (rows.length > MAX_SAME_DIRECTION) {
+      console.error(
+        `[hl-sync] 🚨 CRITICAL: ${key} has ${rows.length} concurrent open positions, exceeding the cap of ${MAX_SAME_DIRECTION}. ` +
+        `IDs: ${rows.map((r) => r.id).join(", ")}. This should be structurally impossible — investigate immediately.`
+      );
+    }
+  }
+}
+
+// ── Rule 2: cancel any resting order that doesn't belong to a currently-open row ──
+async function sweepOrphanedOrders(exchange) {
+  const { data: openTrades } = await supabase
+    .from("hyperliquid_trades")
+    .select("hl_tp_order_id, hl_sl_order_id")
+    .eq("outcome", "open")
+    .eq("environment", TESTNET ? "testnet" : "mainnet");
+
+  const trackedIds = new Set();
+  for (const t of openTrades ?? []) {
+    if (t.hl_tp_order_id) trackedIds.add(String(t.hl_tp_order_id));
+    if (t.hl_sl_order_id) trackedIds.add(String(t.hl_sl_order_id));
+  }
+
+  let orphansFound = 0;
+  for (const [asset, symbol] of Object.entries(HL_SYMBOL)) {
+    let orders;
+    try {
+      orders = await exchange.fetchOpenOrders(symbol);
+    } catch (e) {
+      console.warn(`[hl-sync] Could not fetch open orders for ${asset}: ${e.message}`);
+      continue;
+    }
+    for (const o of orders) {
+      if (!o.reduceOnly) continue; // only bracket (TP/SL) orders are ours to manage
+      if (trackedIds.has(String(o.id))) continue;
+      orphansFound++;
+      console.warn(`[hl-sync] Found orphaned ${asset} order ${o.id} (${o.side} @ ${o.price ?? o.triggerPrice}) — not tracked by any open trade`);
+      await safeCancelOrder(exchange, o.id, symbol, `orphaned ${asset}`);
+    }
+    await sleep(300);
+  }
+
+  if (orphansFound === 0) {
+    console.log("[hl-sync] Orphan sweep: none found.");
+  } else {
+    console.log(`[hl-sync] Orphan sweep: cancelled ${orphansFound} orphaned order(s).`);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`\n[hl-sync] ══════════════════════════════════════`);
@@ -240,15 +385,10 @@ async function main() {
   if (error) throw new Error(`Supabase fetch error: ${error.message}`);
   console.log(`[hl-sync] Checking ${openTrades?.length ?? 0} open trade(s)...\n`);
 
-  if (!openTrades?.length) {
-    console.log("[hl-sync] No open trades to sync.");
-    return;
-  }
-
   let synced = 0;
   let stillOpen = 0;
 
-  for (const trade of openTrades) {
+  for (const trade of openTrades ?? []) {
     console.log(`[hl-sync] Checking ${trade.asset_symbol} ${trade.bias} (opened ${trade.signal_date})...`);
     try {
       const result = await checkTrade(exchange, trade);
@@ -288,6 +428,12 @@ async function main() {
     console.log(`\n[hl-sync] Run this query in Supabase to compare paper vs real:`);
     console.log(`SELECT signal_date, asset_symbol, bias, signal_quality_score, actual_r, outcome as hl_outcome, paper_outcome, paper_r, actual_r - paper_r as r_delta FROM hyperliquid_trades ORDER BY signal_date DESC;`);
   }
+
+  console.log(`\n[hl-sync] Running orphaned-order sweep...`);
+  await sweepOrphanedOrders(exchange);
+
+  console.log(`\n[hl-sync] Running structural health checks...`);
+  await runHealthChecks();
 }
 
 main().catch((err) => {
