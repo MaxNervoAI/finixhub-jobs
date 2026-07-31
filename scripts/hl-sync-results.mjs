@@ -80,30 +80,53 @@ async function safeCancelOrder(exchange, orderId, symbol, label) {
 // Used when the SL/TP order objects are gone (unknownOid) so we can't read
 // their fill price directly. Returns null if no matching closing fill is found
 // — callers must NOT fabricate a P&L number in that case.
+//
+// CRITICAL: fills are matched by `order` id against THIS trade's own
+// hl_tp_order_id/hl_sl_order_id — never by side+timestamp alone. An earlier
+// version filtered by "any closing-side fill since this trade opened", which
+// doesn't distinguish this trade's own closing fill from a *different*
+// same-asset-same-direction trade's fill that happens to fall in the same
+// window. That bug wrongly marked a genuinely-still-open ETH short as closed
+// (crediting it with two *other* trades' TP fills) and cancelled its real,
+// still-valid SL/TP — leaving a live position naked for hours before a user
+// caught it manually. See the wiki bugs log, incident #11 (2026-08-01).
 async function reconstructExitFromTrades(exchange, trade, symbol) {
-  const since = trade.created_at ? new Date(trade.created_at).getTime() : undefined;
-  const closingSide = trade.bias === "long" ? "sell" : "buy";
+  const ownOrderIds = new Set([trade.hl_tp_order_id, trade.hl_sl_order_id].filter(Boolean).map(String));
+  if (!ownOrderIds.size) return null;
 
   try {
     // Fetch without `since` — Hyperliquid's time-bounded fills endpoint
     // (userFillsByTime, used when `since` is passed) has proven unreliable;
     // the default fills endpoint (userFills, last ~2000 fills) is the
-    // battle-tested path. Filter by time/side ourselves instead.
+    // battle-tested path.
     const myTrades = await exchange.fetchMyTrades(symbol);
+    const ownFills = (myTrades ?? []).filter((t) => ownOrderIds.has(String(t.order)));
     console.log(
       `[hl-sync] ${trade.asset_symbol} ${trade.bias}: fetched ${myTrades?.length ?? 0} raw fill(s) for symbol, ` +
-      `sides seen: ${[...new Set((myTrades ?? []).map((t) => t.side))].join(",") || "none"}`
+      `${ownFills.length} matched to this trade's own order id(s)`
     );
-    const closingFills = (myTrades ?? []).filter(
-      (t) => t.side === closingSide && (since == null || t.timestamp >= since)
-    );
-    if (!closingFills.length) return null;
+    if (!ownFills.length) return null;
 
-    const totalQty = closingFills.reduce((s, t) => s + t.amount, 0);
-    const notional = closingFills.reduce((s, t) => s + t.amount * t.price, 0);
+    const totalQty = ownFills.reduce((s, t) => s + t.amount, 0);
+    const notional = ownFills.reduce((s, t) => s + t.amount * t.price, 0);
     if (totalQty <= 0) return null;
 
-    const lastTs = Math.max(...closingFills.map((t) => t.timestamp));
+    // Only a fill covering the FULL tracked size proves the trade is closed.
+    // A partial fill (e.g. a partial TP) is real progress but not a close —
+    // see rule 5 (partial-fill visibility) in checkTrade. Fabricating a
+    // "closed" result off a partial match is exactly what caused a
+    // partially-filled BTC position to get marked fully closed and its
+    // still-live remainder left unprotected.
+    const size = trade.position_size_contracts;
+    if (size && totalQty < size * 0.999) {
+      console.warn(
+        `[hl-sync] ⚠ PARTIAL FILL via own order(s): ${trade.asset_symbol} ${trade.bias} — ` +
+        `${totalQty}/${size} filled. Leaving as open; no partial-position accounting exists yet.`
+      );
+      return null;
+    }
+
+    const lastTs = Math.max(...ownFills.map((t) => t.timestamp));
     return { exitPrice: notional / totalQty, closedAt: new Date(lastTs).toISOString() };
   } catch (e) {
     console.warn(`[hl-sync] Could not reconstruct exit via trade history: ${e.message}`);
