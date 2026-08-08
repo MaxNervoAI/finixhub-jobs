@@ -26,6 +26,14 @@
  *   5. Flag (log only) partial fills (filled > 0 and remaining > 0) — this
  *      system has no partial-position accounting, so a partial fill is
  *      surfaced for visibility rather than silently mishandled.
+ *   6. If a tracked TP/SL order comes back `cancelled`/`rejected` (not
+ *      filled, not resting) while its trade is still genuinely open,
+ *      re-place a fresh one at the same (re-derived) level and update the
+ *      DB. Found 2026-08-08: Hyperliquid auto-cancelled a resting TP with
+ *      `reduceOnlyCanceled` (likely a transient position-size mismatch
+ *      while other same-asset trades stacked/unstacked) — nothing in this
+ *      script previously distinguished "cancelled" from "still resting",
+ *      so the position sat missing its TP, undetected, for over a week.
  *
  * Usage: node scripts/hl-sync-results.mjs
  */
@@ -134,6 +142,58 @@ async function reconstructExitFromTrades(exchange, trade, symbol) {
   }
 }
 
+function round(value, decimals) {
+  const factor = Math.pow(10, decimals);
+  return Math.round(value * factor) / factor;
+}
+
+// ── Rule 6: re-place a tracked bracket order the exchange cancelled ──────────
+// Only fires for orders that come back explicitly `cancelled`/`rejected` —
+// never for orders that are simply resting (`open`) or `unknownOid` (handled
+// by the reconstruction path instead). Re-derives the level using the same
+// proportional-adjustment math hl-signal-trader.mjs used at entry, so the
+// replacement lands at the same real target the original order had.
+async function ensureBracketProtection(exchange, trade, symbol, tpOrder, slOrder) {
+  const isLong = trade.bias === "long";
+  const signalEntry = parseFloat(trade.signal_entry_price);
+  const actualEntry = parseFloat(trade.actual_entry_price);
+  const ratio = signalEntry ? actualEntry / signalEntry : 1;
+
+  if (trade.hl_tp_order_id && orderStatus(tpOrder) === "cancelled") {
+    console.error(`[hl-sync] 🚨 ${trade.asset_symbol} ${trade.bias}: tracked TP order ${trade.hl_tp_order_id} was cancelled by the exchange (not filled) — re-placing.`);
+    try {
+      const tpPrice = round(parseFloat(trade.signal_tp1) * ratio, 2);
+      const closeSide = isLong ? "sell" : "buy";
+      const newTp = await exchange.createOrder(symbol, "limit", closeSide, trade.position_size_contracts, tpPrice, {
+        postOnly: true,
+        reduceOnly: true,
+      });
+      await supabase.from("hyperliquid_trades").update({ hl_tp_order_id: newTp.id, updated_at: new Date().toISOString() }).eq("id", trade.id);
+      console.log(`[hl-sync] ✓ TP re-placed at $${tpPrice} | id:${newTp.id}`);
+    } catch (e) {
+      console.error(`[hl-sync] ✗ Failed to re-place TP for trade ${trade.id}: ${e.message} — SL still protects, but no profit target is resting.`);
+    }
+    await sleep(300);
+  }
+
+  if (trade.hl_sl_order_id && orderStatus(slOrder) === "cancelled") {
+    console.error(`[hl-sync] 🚨 ${trade.asset_symbol} ${trade.bias}: tracked SL order ${trade.hl_sl_order_id} was cancelled by the exchange (not filled) — re-placing immediately, position is UNPROTECTED until this succeeds.`);
+    try {
+      const slPrice = round(parseFloat(trade.signal_sl) * ratio, 2);
+      const closeSide = isLong ? "sell" : "buy";
+      const newSl = await exchange.createOrder(symbol, "stop", closeSide, trade.position_size_contracts, slPrice, {
+        triggerPrice: slPrice,
+        reduceOnly: true,
+      });
+      await supabase.from("hyperliquid_trades").update({ hl_sl_order_id: newSl.id, updated_at: new Date().toISOString() }).eq("id", trade.id);
+      console.log(`[hl-sync] ✓ SL re-placed at $${slPrice} | id:${newSl.id}`);
+    } catch (e) {
+      console.error(`[hl-sync] ✗✗ FAILED to re-place SL for trade ${trade.id}: ${e.message} — position remains UNPROTECTED. Needs immediate manual attention.`);
+    }
+    await sleep(300);
+  }
+}
+
 // ── Check one open trade ──────────────────────────────────────────────────────
 async function checkTrade(exchange, trade) {
   const symbol = HL_SYMBOL[trade.asset_symbol];
@@ -173,6 +233,11 @@ async function checkTrade(exchange, trade) {
   if (isPartialFill(slOrder)) {
     console.warn(`[hl-sync] ⚠ PARTIAL FILL: ${trade.asset_symbol} ${trade.bias} SL order ${trade.hl_sl_order_id} — filled ${slOrder.filled}/${(slOrder.filled ?? 0) + (slOrder.remaining ?? 0)}. Leaving as open; no partial-position accounting exists yet.`);
   }
+
+  // Rule 6: an order that's explicitly cancelled/rejected (not filled, not
+  // resting) means the position is missing real protection right now — fix
+  // that before doing anything else with this trade this run.
+  await ensureBracketProtection(exchange, trade, symbol, tpOrder, slOrder);
 
   const tpFilled = orderStatus(tpOrder) === "filled";
   const slFilled = orderStatus(slOrder) === "filled";
