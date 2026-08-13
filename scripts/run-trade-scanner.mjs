@@ -32,7 +32,28 @@ const WEIGHTS = {
 };
 
 const SCORING_VERSION = "v2";
-const MIN_RRR = 2.0;
+// v3: MIN_RRR now checked against a geometrically computed ratio (see
+// computeGeometricRRR below), not the AI's self-reported risk_reward_ratio.
+// The AI's number was found to be essentially decorative — it wrote ~2.0
+// almost regardless of the actual entry/invalidation_level/take_profit_levels
+// it picked (real ratios observed ranging 0.38-2.00 against claims that were
+// always ~2.0). 1.2 (not the original 2.0) is the empirically-supported floor:
+// backtesting live trades against the real computed ratio showed profit held
+// roughly flat down to ~1.1-1.2 while max drawdown fell ~7x (from $16 to
+// ~$2-7) versus no floor at all; tightening further to 1.5-2.0 started
+// cutting real winners along with the bad setups without further reducing
+// drawdown. See vault: 02-lab/hl-paper-trading/architecture/signal-scanner-rrr-fix.md
+const MIN_RRR = 1.2;
+
+// Real geometric risk:reward from the actual entry/SL/TP1 levels, independent
+// of whatever risk_reward_ratio the AI claims. Long: reward = TP - entry,
+// risk = entry - SL. Short: reward = entry - TP, risk = SL - entry.
+function computeGeometricRRR(entryPrice, invalidationLevel, tp1Level, bias) {
+  const risk = bias === "long" ? entryPrice - invalidationLevel : invalidationLevel - entryPrice;
+  const reward = bias === "long" ? tp1Level - entryPrice : entryPrice - tp1Level;
+  if (!(risk > 0)) return 0;
+  return reward / risk;
+}
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
@@ -403,10 +424,25 @@ async function processAsset(supabase, asset) {
       }
     }
 
-    // RRR gate — skip low-quality setups before scoring
-    if ((scenario.risk_reward_ratio ?? 0) < MIN_RRR) {
-      console.warn(`[${asset}] ${bias} skipped — RRR ${scenario.risk_reward_ratio} < ${MIN_RRR}`);
+    // RRR gate — skip low-quality setups before scoring. Uses the real
+    // geometric ratio from entry/invalidation_level/take_profit_levels[0],
+    // not the AI's self-reported risk_reward_ratio (which doesn't reliably
+    // reflect the actual levels it just picked — see MIN_RRR comment above).
+    // Overwrite scenario.risk_reward_ratio with the real number so every
+    // downstream consumer (quality scoring, DB row, hl-signal-trader) sees
+    // the honest ratio, not the AI's claim.
+    const geometricRRR = scenario.entry_price && scenario.invalidation_level && scenario.take_profit_levels?.[0]?.level
+      ? computeGeometricRRR(scenario.entry_price, scenario.invalidation_level, scenario.take_profit_levels[0].level, bias)
+      : 0;
+    const claimedRRR = scenario.risk_reward_ratio ?? 0;
+    scenario.risk_reward_ratio = geometricRRR;
+
+    if (geometricRRR < MIN_RRR) {
+      console.warn(`[${asset}] ${bias} skipped — real RRR ${geometricRRR.toFixed(2)} < ${MIN_RRR} (AI claimed ${claimedRRR})`);
       continue;
+    }
+    if (Math.abs(geometricRRR - claimedRRR) > 0.3) {
+      console.warn(`[${asset}] ${bias} RRR mismatch — AI claimed ${claimedRRR}, real geometry is ${geometricRRR.toFixed(2)}. Using real value.`);
     }
 
     const scores = calculateScenarioScore(
