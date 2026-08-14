@@ -165,6 +165,36 @@ async function fetchPaperResult(opportunityId) {
   return { paper_outcome: data.final_status, paper_r: paperR };
 }
 
+// ── Shadow-capture: trend context at flip time (observation only — does NOT ─
+// influence the flip decision above). Investigating whether flip
+// disproportionately cuts with-trend positions short vs against-trend ones;
+// see vault: 02-lab/hl-paper-trading/architecture/flip-trend-shadow-logging.md
+async function fetchFlipTrendContext(assetSymbol) {
+  const { data } = await supabase
+    .from("asset_daily_summary")
+    .select("adx_14, di_plus_14, di_minus_14")
+    .eq("symbol", assetSymbol)
+    .order("date", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!data || data.di_plus_14 == null || data.di_minus_14 == null) return {};
+
+  const diPlus = parseFloat(data.di_plus_14);
+  const diMinus = parseFloat(data.di_minus_14);
+  const margin = Math.abs(diPlus - diMinus);
+
+  return {
+    flip_di_plus: diPlus,
+    flip_di_minus: diMinus,
+    flip_adx: data.adx_14 != null ? parseFloat(data.adx_14) : null,
+    flip_trend_direction: diPlus > diMinus ? "up" : "down",
+    // 8 is not arbitrary — it's the threshold that separated genuine trend
+    // readings from noise in both the live-trade and paper-trading analysis.
+    flip_classification_confidence: margin >= 8 ? "high" : "low",
+  };
+}
+
 // ── Close an existing position at market because a new opposite-direction ────
 // signal arrived. Cancels its resting SL/TP first so they can't fill against
 // the market close (or the newly-opened opposite position) as an orphaned
@@ -208,6 +238,11 @@ async function flipClosePosition(exchange, position) {
     : null;
 
   const paper = await fetchPaperResult(position.opportunity_id);
+  const trendContext = await fetchFlipTrendContext(position.asset_symbol);
+  const flipPositionAligned = trendContext.flip_trend_direction
+    ? (isLong && trendContext.flip_trend_direction === "up") ||
+      (!isLong && trendContext.flip_trend_direction === "down")
+    : null;
 
   const { error } = await supabase
     .from("hyperliquid_trades")
@@ -220,12 +255,19 @@ async function flipClosePosition(exchange, position) {
       days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
       close_reason: "flip",
       ...paper,
+      ...trendContext,
+      flip_position_aligned: flipPositionAligned,
       updated_at: new Date().toISOString(),
     })
     .eq("id", position.id);
 
   if (error) console.error(`[hl-trader] Failed to record flip-close for ${position.id}: ${error.message}`);
-  else console.log(`[hl-trader] ✓ Recorded flip-close | R:${actualR != null ? actualR.toFixed(2) : "n/a"}`);
+  else {
+    const trendNote = trendContext.flip_trend_direction
+      ? ` | trend:${trendContext.flip_trend_direction} (DI+:${trendContext.flip_di_plus.toFixed(1)} DI-:${trendContext.flip_di_minus.toFixed(1)}, ${trendContext.flip_classification_confidence}-confidence) aligned:${flipPositionAligned}`
+      : " | trend: n/a";
+    console.log(`[hl-trader] ✓ Recorded flip-close | R:${actualR != null ? actualR.toFixed(2) : "n/a"}${trendNote}`);
+  }
 }
 
 // ── Fetch signals not yet traded on HL ───────────────────────────────────────
