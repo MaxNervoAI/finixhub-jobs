@@ -41,6 +41,7 @@
 import "dotenv/config";
 import ccxt from "ccxt";
 import { createClient } from "@supabase/supabase-js";
+import { fetchCumFundingSinceOpen } from "./lib/hl-funding.mjs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -56,6 +57,12 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !WALLET_ADDRESS || !PRIVATE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const HL_SYMBOL = { BTC: "BTC/USDC:USDC", ETH: "ETH/USDC:USDC", SOL: "SOL/USDC:USDC" };
 const MAX_SAME_DIRECTION = 2; // must match hl-signal-trader.mjs
+// Force-close a position once cumulative funding paid reaches this fraction
+// of its own $ risk budget — hl-signal-trader.mjs's entry guard blocks new
+// entries into a bad funding environment, but a position can still walk into
+// one after opening (funding rate moves independently of price). 1.0 means
+// "funding alone has now cost as much as the position's intended max loss."
+const FUNDING_STOP_FRACTION = parseFloat(process.env.HL_FUNDING_STOP_FRACTION ?? "1.0");
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -194,6 +201,67 @@ async function ensureBracketProtection(exchange, trade, symbol, tpOrder, slOrder
   }
 }
 
+// ── Funding stop: force-close if funding paid has eaten the risk budget ──────
+// Added 2026-08-23 after a live testnet ETH long paid $14.36 in funding
+// against a $5 risk budget while its price PnL was only +$2.94 — SL/TP alone
+// never would have caught this, since price never moved far enough to trigger
+// either. Reads cumFunding directly off the live position (not derivable from
+// the DB), so this must run against the exchange, not against stored state.
+async function checkFundingStop(exchange, trade, symbol) {
+  if (!trade.risk_usd || !trade.position_size_contracts) return null;
+
+  let cumFunding;
+  try {
+    cumFunding = await fetchCumFundingSinceOpen(TESTNET, WALLET_ADDRESS, trade.asset_symbol);
+  } catch (e) {
+    console.warn(`[hl-sync] Could not fetch funding for ${trade.asset_symbol}: ${e.message}`);
+    return null;
+  }
+  if (cumFunding == null) return null; // no live position for this coin right now
+
+  // Positive cumFunding = net paid out (a cost). Negative = net received —
+  // never a reason to stop.
+  const fundingPaid = Math.max(cumFunding, 0);
+  const threshold = trade.risk_usd * FUNDING_STOP_FRACTION;
+  if (fundingPaid < threshold) return null;
+
+  console.error(
+    `[hl-sync] 🛑 FUNDING STOP: ${trade.asset_symbol} ${trade.bias} has paid $${fundingPaid.toFixed(2)} in funding, ` +
+    `≥ ${(FUNDING_STOP_FRACTION * 100).toFixed(0)}% of its $${trade.risk_usd} risk budget — closing at market.`
+  );
+
+  const isLong = trade.bias === "long";
+  const closeSide = isLong ? "sell" : "buy";
+
+  await safeCancelOrder(exchange, trade.hl_tp_order_id, symbol, "TP");
+  await safeCancelOrder(exchange, trade.hl_sl_order_id, symbol, "SL");
+
+  const referencePrice = (await exchange.fetchTicker(symbol)).last;
+  const closeOrder = await exchange.createOrder(symbol, "market", closeSide, trade.position_size_contracts, referencePrice, {
+    reduceOnly: true,
+    slippagePercentage: 5,
+  });
+  const exitPrice = closeOrder.average ?? referencePrice;
+  console.log(`[hl-sync] ✓ Funding-stopped at $${exitPrice}`);
+
+  const priceDiff = isLong ? exitPrice - trade.actual_entry_price : trade.actual_entry_price - exitPrice;
+  const actualPnlUsd = priceDiff * trade.position_size_contracts;
+  const actualR = trade.risk_usd ? actualPnlUsd / trade.risk_usd : null;
+  const daysHeld = trade.created_at
+    ? (Date.now() - new Date(trade.created_at).getTime()) / (1000 * 60 * 60 * 24)
+    : null;
+
+  return {
+    outcome: actualPnlUsd >= 0 ? "winner" : "loser",
+    actual_exit_price: exitPrice,
+    actual_pnl_usd: parseFloat(actualPnlUsd.toFixed(2)),
+    actual_r: actualR != null ? parseFloat(actualR.toFixed(3)) : null,
+    closed_at: new Date().toISOString(),
+    days_held: daysHeld != null ? parseFloat(daysHeld.toFixed(2)) : null,
+    close_reason: "funding_stop",
+  };
+}
+
 // ── Check one open trade ──────────────────────────────────────────────────────
 async function checkTrade(exchange, trade) {
   const symbol = HL_SYMBOL[trade.asset_symbol];
@@ -201,6 +269,9 @@ async function checkTrade(exchange, trade) {
     console.warn(`[hl-sync] Unknown asset ${trade.asset_symbol} for trade ${trade.id}`);
     return null;
   }
+
+  const fundingStop = await checkFundingStop(exchange, trade, symbol);
+  if (fundingStop) return fundingStop;
 
   const isLong = trade.bias === "long";
 
