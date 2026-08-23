@@ -38,6 +38,7 @@
 import "dotenv/config";
 import ccxt from "ccxt";
 import { createClient } from "@supabase/supabase-js";
+import { fetchFundingContext } from "./lib/hl-funding.mjs";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -49,6 +50,15 @@ const RISK_USD = parseFloat(process.env.HL_RISK_PER_TRADE_USD ?? "15");
 const MIN_QUALITY = 70;
 const MAX_SAME_DIRECTION = 2;
 const DRY_RUN = process.argv.includes("--dry-run");
+// A mark/oracle premium this large means a thin/illiquid book — the exact
+// symptom that let a 0.4%/hr funding rate run up in the 2026-08-23 incident.
+// Direction-agnostic: blocks entry on either side, since a blown-out premium
+// is a market-quality problem, not a "which side pays" problem.
+const MAX_ENTRY_PREMIUM_PCT = parseFloat(process.env.HL_MAX_ENTRY_PREMIUM_PCT ?? "0.75");
+// Baseline HL funding is roughly ±0.01%/hr; this is well above that but far
+// below the 0.4%/hr seen in the incident. Only blocks entry when the side
+// being opened is the side that would actually pay.
+const MAX_ENTRY_FUNDING_HOURLY_PCT = parseFloat(process.env.HL_MAX_ENTRY_FUNDING_HOURLY_PCT ?? "0.03");
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("[hl-trader] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -103,6 +113,33 @@ const ENTRY_RETRY_DELAY_MS = 3000;
 // chasing is most dangerous, not least. Skips are logged with the signal's
 // age so this can be tuned later from real data instead of a guess now.
 const ENTRY_MAX_DEVIATION_PCT = 1.5;
+
+// ── Funding/premium guard ──────────────────────────────────────────────────
+// Checked once per entry attempt (funding doesn't move fast enough within a
+// few-second retry window to be worth re-checking per attempt, unlike price).
+// Non-retryable, same as the stale-price guard: a blown-out premium or
+// funding rate is a market-quality problem that waiting a few seconds won't
+// fix.
+async function checkFundingGuard(coin, isLong) {
+  const { fundingHourlyPct, premiumPct, markPx, oraclePx } = await fetchFundingContext(TESTNET, coin);
+
+  if (premiumPct > MAX_ENTRY_PREMIUM_PCT) {
+    throw new Error(
+      `${coin} mark/oracle premium ${premiumPct.toFixed(2)}% exceeds ${MAX_ENTRY_PREMIUM_PCT}% max ` +
+      `(mark:$${markPx} vs oracle:$${oraclePx}) — thin/illiquid book, not entering.`
+    );
+  }
+
+  // Positive funding: longs pay shorts. Negative funding: shorts pay longs.
+  const payingSide = fundingHourlyPct > 0 ? "long" : fundingHourlyPct < 0 ? "short" : null;
+  const wouldPay = (isLong && payingSide === "long") || (!isLong && payingSide === "short");
+  if (wouldPay && Math.abs(fundingHourlyPct) > MAX_ENTRY_FUNDING_HOURLY_PCT) {
+    throw new Error(
+      `${coin} funding rate ${fundingHourlyPct.toFixed(4)}%/hr would be paid by this ${isLong ? "LONG" : "SHORT"}, ` +
+      `exceeding ${MAX_ENTRY_FUNDING_HOURLY_PCT}%/hr max — not entering.`
+    );
+  }
+}
 
 async function placeMarketEntry(exchange, symbol, side, posSize, referencePrice, signalAgeMin) {
   let lastErr;
@@ -319,6 +356,10 @@ async function openTrade(exchange, signal, riskUsd) {
   const posSize = calcPositionSize(riskUsd, entryPrice, slPrice, amtPrecision);
 
   console.log(`[hl-trader] ${signal.asset_symbol} ${signal.bias.toUpperCase()} | quality:${signal.quality_score} | entry:$${entryPrice} | SL:$${slPrice} | TP:$${tpPrice} | size:${posSize}`);
+
+  // ── 0. Funding/premium guard ──────────────────────────────────────────────
+  // Runs even in DRY_RUN so threshold tuning is visible without risking money.
+  await checkFundingGuard(signal.asset_symbol, isLong);
 
   if (DRY_RUN) {
     console.log(`[hl-trader] DRY RUN — skipping order placement`);
