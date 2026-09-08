@@ -178,6 +178,16 @@ async function ensureBracketProtection(exchange, trade, symbol, tpOrder, slOrder
       await supabase.from("hyperliquid_trades").update({ hl_tp_order_id: newTp.id, updated_at: new Date().toISOString() }).eq("id", trade.id);
       console.log(`[hl-sync] ✓ TP re-placed at $${tpPrice} | id:${newTp.id}`);
     } catch (e) {
+      // "Reduce only order would increase position" is the exchange telling us
+      // the position is FLAT — a reduce-only order can only shrink a position,
+      // so it can't be placed when there's nothing to shrink. That is hard
+      // proof the trade is already closed, and re-placing the SL on top of it
+      // would strand a live order against a position that doesn't exist
+      // (exactly what happened on 2026-09-05, leaving two orphaned ETH stops).
+      if (isFlatPositionRejection(e)) {
+        console.warn(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: TP re-place rejected as reduce-only-would-increase — position is FLAT. Skipping bracket re-placement; the close will be reconciled from trade history below.`);
+        return { flat: true };
+      }
       console.error(`[hl-sync] ✗ Failed to re-place TP for trade ${trade.id}: ${e.message} — SL still protects, but no profit target is resting.`);
     }
     await sleep(300);
@@ -195,10 +205,23 @@ async function ensureBracketProtection(exchange, trade, symbol, tpOrder, slOrder
       await supabase.from("hyperliquid_trades").update({ hl_sl_order_id: newSl.id, updated_at: new Date().toISOString() }).eq("id", trade.id);
       console.log(`[hl-sync] ✓ SL re-placed at $${slPrice} | id:${newSl.id}`);
     } catch (e) {
+      if (isFlatPositionRejection(e)) {
+        console.warn(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: SL re-place rejected as reduce-only-would-increase — position is FLAT, nothing to protect.`);
+        return { flat: true };
+      }
       console.error(`[hl-sync] ✗✗ FAILED to re-place SL for trade ${trade.id}: ${e.message} — position remains UNPROTECTED. Needs immediate manual attention.`);
     }
     await sleep(300);
   }
+
+  return { flat: false };
+}
+
+// Hyperliquid rejects a reduce-only order with this when the position is flat.
+// Treated as positive evidence of closure — unlike fetchPositions, which this
+// script deliberately distrusts, this is the exchange refusing a write.
+function isFlatPositionRejection(err) {
+  return /reduce only order would increase position/i.test(err?.message ?? "");
 }
 
 // ── Funding stop: force-close if funding paid has eaten the risk budget ──────
@@ -308,7 +331,10 @@ async function checkTrade(exchange, trade) {
   // Rule 6: an order that's explicitly cancelled/rejected (not filled, not
   // resting) means the position is missing real protection right now — fix
   // that before doing anything else with this trade this run.
-  await ensureBracketProtection(exchange, trade, symbol, tpOrder, slOrder);
+  const bracketState = await ensureBracketProtection(exchange, trade, symbol, tpOrder, slOrder);
+  if (bracketState?.flat) {
+    console.log(`[hl-sync] ${trade.asset_symbol} ${trade.bias}: exchange reports position flat — reconciling close from trade history.`);
+  }
 
   const tpFilled = orderStatus(tpOrder) === "filled";
   const slFilled = orderStatus(slOrder) === "filled";
@@ -546,6 +572,10 @@ async function main() {
 
   let synced = 0;
   let stillOpen = 0;
+  // Writes that failed AFTER the position was already closed on the exchange.
+  // These are the dangerous ones: the trade is irreversibly closed in reality
+  // but the DB still says 'open', and nothing retries. Must fail the run.
+  const failedWrites = [];
 
   for (const trade of openTrades ?? []) {
     console.log(`[hl-sync] Checking ${trade.asset_symbol} ${trade.bias} (opened ${trade.signal_date})...`);
@@ -572,7 +602,18 @@ async function main() {
         .eq("id", trade.id);
 
       if (updateErr) {
-        console.error(`[hl-sync] Failed to update trade ${trade.id}: ${updateErr.message}`);
+        // The exchange side is already done — a lost write here permanently
+        // diverges the DB from reality. Silently swallowing this is what let
+        // two funding-stopped ETH shorts sit as 'open' from 2026-09-05 until
+        // a manual audit found them (close_reason='funding_stop' was missing
+        // from the CHECK constraint for ~2 weeks after the funding stop
+        // shipped). Record it and fail the run so it is visible immediately.
+        console.error(
+          `[hl-sync] 🚨 LOST WRITE for trade ${trade.id} (${trade.asset_symbol} ${trade.bias}): ${updateErr.message}\n` +
+          `[hl-sync]    Position is ALREADY CLOSED on the exchange but the DB still says 'open'. ` +
+          `Intended update: ${JSON.stringify({ ...result, ...paper })}`
+        );
+        failedWrites.push({ id: trade.id, symbol: trade.asset_symbol, bias: trade.bias, message: updateErr.message });
       } else {
         synced++;
       }
@@ -593,6 +634,17 @@ async function main() {
 
   console.log(`\n[hl-sync] Running structural health checks...`);
   await runHealthChecks();
+
+  if (failedWrites.length) {
+    console.error(
+      `\n[hl-sync] 🚨 ${failedWrites.length} trade(s) closed on the exchange but FAILED to persist:`
+    );
+    for (const f of failedWrites) {
+      console.error(`[hl-sync]   - ${f.id} (${f.symbol} ${f.bias}): ${f.message}`);
+    }
+    console.error(`[hl-sync] These rows are still marked 'open' and will not self-heal. Fix and backfill manually.`);
+    process.exitCode = 1;
+  }
 }
 
 main().catch((err) => {
