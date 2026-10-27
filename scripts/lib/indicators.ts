@@ -8,24 +8,38 @@ export interface OHLCVData {
 }
 
 // Technical Indicator Calculation Functions
+/**
+ * Wilder's RSI for every day of `prices` (null until `period` changes exist). Standard definition, as
+ * TradingView: the first average is the plain mean of the first `period` changes, then
+ * avg = (prev × (period − 1) + current) / period.
+ */
+export function rsiSeries(prices: number[], period: number = 14): Array<number | null> {
+  const out: Array<number | null> = new Array(prices.length).fill(null);
+  if (prices.length <= period) return out;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const ch = prices[i] - prices[i - 1];
+    if (ch > 0) avgGain += ch; else avgLoss -= ch;
+  }
+  avgGain /= period; avgLoss /= period;
+  const value = () => (avgLoss === 0 ? (avgGain === 0 ? 50 : 100) : 100 - 100 / (1 + avgGain / avgLoss));
+  out[period] = value();
+  for (let i = period + 1; i < prices.length; i++) {
+    const ch = prices[i] - prices[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(ch, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-ch, 0)) / period;
+    out[i] = value();
+  }
+  return out;
+}
+
+/**
+ * Today's RSI: the last value of Wilder's RSI over the whole series. (It used to average the FIRST
+ * `period` changes of the window, i.e. months ago — finixhub#256.)
+ */
 export function calculateRSI(prices: number[], period: number = 14): number {
   if (prices.length < period + 1) return 50;
-
-  let gains = 0;
-  let losses = 0;
-
-  for (let i = 1; i <= period; i++) {
-    const change = prices[i] - prices[i - 1];
-    if (change > 0) gains += change;
-    else losses += Math.abs(change);
-  }
-
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  return rsiSeries(prices, period).at(-1) as number;
 }
 
 export function calculateEMA(prices: number[], period: number): number {
@@ -86,25 +100,24 @@ export function calculateBollingerBands(prices: number[], period: number = 20, s
   };
 }
 
+/** Wilder's ATR: mean of the first `period` true ranges, then Wilder smoothing (finixhub#256). */
 export function calculateATR(data: OHLCVData[], period: number = 14): number {
   if (data.length < period + 1) return 0;
 
-  const trueRanges: number[] = [];
+  let atr = 0;
   for (let i = 1; i < data.length; i++) {
-    const high = data[i].high;
-    const low = data[i].low;
-    const prevClose = data[i - 1].close;
-
     const tr = Math.max(
-      high - low,
-      Math.abs(high - prevClose),
-      Math.abs(low - prevClose)
+      data[i].high - data[i].low,
+      Math.abs(data[i].high - data[i - 1].close),
+      Math.abs(data[i].low - data[i - 1].close)
     );
-    trueRanges.push(tr);
+    if (i <= period) {
+      atr += tr / period;
+    } else {
+      atr = (atr * (period - 1) + tr) / period;
+    }
   }
-
-  const atr = trueRanges.slice(-period).reduce((a, b) => a + b, 0) / period;
-  return parseFloat(atr.toFixed(2));
+  return parseFloat(atr.toFixed(8));
 }
 
 // === NEW TRADINGVIEW TECHNICAL RATINGS MATH FUNCTIONS ===
@@ -269,8 +282,10 @@ export function calculateADX(data: OHLCVData[], period = 14) {
     dxValues.push(dx);
   }
 
-  // ADX is SMMA of DX
-  const adx = dxValues.slice(-period).reduce((a, b) => a + b, 0) / period;
+  // ADX is Wilder-smoothed DX: mean of the first `period` DX values, then
+  // adx = (prev × (period − 1) + dx) / period. It used to be a plain mean of the last 14 (finixhub#256).
+  let adx = dxValues.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxValues.length; i++) adx = (adx * (period - 1) + dxValues[i]) / period;
 
   const latestPlusDI = (smoothedPlusDM[smoothedPlusDM.length - 1] / smoothedTR[smoothedTR.length - 1]) * 100;
   const latestMinusDI = (smoothedMinusDM[smoothedMinusDM.length - 1] / smoothedTR[smoothedTR.length - 1]) * 100;
@@ -348,12 +363,8 @@ export function calculateUltimateOscillator(data: OHLCVData[], p1 = 7, p2 = 14, 
 // === END NEW MATH ===
 
 export function calculateStochasticRSI(prices: number[], period: number = 14): { k: number; d: number } {
-  const rsiValues: number[] = [];
-
-  for (let i = period; i <= prices.length; i++) {
-    const slice = prices.slice(i - period - 1, i);
-    rsiValues.push(calculateRSI(slice, period));
-  }
+  // Stochastic of Wilder's RSI series (each value used to be a separate 14-change RSI, finixhub#256).
+  const rsiValues = rsiSeries(prices, period).filter((v): v is number => v !== null);
 
   if (rsiValues.length < 14) {
     return { k: 50, d: 50 };
