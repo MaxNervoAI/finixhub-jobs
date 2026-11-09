@@ -1,7 +1,7 @@
 // Run: npx tsx --test scripts/lib/indicators.test.ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateADX, calculateATR, calculateRSI, calculateStochasticRSI, rsiSeries, type OHLCVData } from './indicators';
+import { calculateADX, calculateATR, calculateBollingerBands, calculateMACD, calculateRSI, calculateStochasticRSI, calculateSupportResistance, calculateVWAP, roundToScale, rsiSeries, type OHLCVData } from './indicators';
 
 // Wilder's RSI worked example (StockCharts ChartSchool), closes rounded to cents. RSI_DEF is Wilder's
 // definition computed by an independent implementation; the same fixture tests the chat's
@@ -64,3 +64,79 @@ test('Stochastic RSI uses Wilder RSI and stays within 0..100', () => {
   const s = calculateStochasticRSI(CLOSES, 14);
   assert.ok(s.k >= 0 && s.k <= 100 && s.d >= 0 && s.d <= 100);
 });
+
+// ---- Price precision (finixhub: stored bands of 0 / 0 for cheap coins) ----
+// The daily summary is read by the app to build plan levels. A flat toFixed(2) stored a $0.0000045
+// coin's Bollinger bands as 0 / 0, and 2-decimal bands are meaningless for anything under about $0.5.
+
+const meanSd = (xs: number[]) => {
+  const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+  return { m, sd: Math.sqrt(xs.reduce((s, x) => s + (x - m) ** 2, 0) / xs.length) };
+};
+const wave = (base: number, n = 40) => Array.from({ length: n }, (_, i) => base * (1 + 0.04 * Math.sin(i / 2) + 0.0005 * i));
+
+test('roundToScale keeps cents from 1 up and 4 significant digits below 1', () => {
+  assert.equal(roundToScale(83834.3217), 83834.32);
+  assert.equal(roundToScale(1.10349), 1.1);
+  assert.equal(roundToScale(0.52349), 0.5235);
+  assert.equal(roundToScale(0.0063521), 0.006352);
+  assert.equal(roundToScale(0.0000044749), 0.000004475);
+  assert.equal(roundToScale(-0.0000012344), -0.000001234);
+  assert.equal(roundToScale(0), 0);
+  assert.equal(roundToScale(Number.NaN), 0);
+  assert.equal(roundToScale(0.0123456, 6), 0.012346); // a larger minimum is respected
+  assert.equal(roundToScale(0.123456, 4), 0.1235);
+});
+
+test('Bollinger bands of a $0.0000045 coin are not stored as 0 / 0', () => {
+  const prices = wave(0.0000045);
+  const bb = calculateBollingerBands(prices);
+  const { m, sd } = meanSd(prices.slice(-20));
+  assert.ok(bb.upper > 0 && bb.lower > 0 && bb.upper > bb.middle && bb.middle > bb.lower, JSON.stringify(bb));
+  assert.ok(Math.abs(bb.upper - (m + 2 * sd)) / (m + 2 * sd) < 1e-3, `upper ${bb.upper}`);
+  assert.ok(Math.abs(bb.lower - (m - 2 * sd)) / (m - 2 * sd) < 1e-3, `lower ${bb.lower}`);
+});
+
+test('Bollinger bands of a $0.07 coin keep their width (stored as 0.07 / 0.08 before)', () => {
+  const prices = wave(0.07);
+  const bb = calculateBollingerBands(prices);
+  const { m, sd } = meanSd(prices.slice(-20));
+  assert.ok(Math.abs(bb.upper - (m + 2 * sd)) / (m + 2 * sd) < 1e-3, `upper ${bb.upper}`);
+  assert.ok(Math.abs(bb.lower - (m - 2 * sd)) / (m - 2 * sd) < 1e-3, `lower ${bb.lower}`);
+  assert.ok(bb.upper - bb.lower > 0.005, `width ${bb.upper - bb.lower}`);
+});
+
+test('Bollinger bands of an expensive asset are unchanged: still rounded to cents', () => {
+  const prices = wave(78000);
+  const bb = calculateBollingerBands(prices);
+  const { m, sd } = meanSd(prices.slice(-20));
+  assert.equal(bb.upper, parseFloat((m + 2 * sd).toFixed(2)));
+  assert.equal(bb.middle, parseFloat(m.toFixed(2)));
+  assert.equal(bb.lower, parseFloat((m - 2 * sd).toFixed(2)));
+});
+
+test('MACD of a cheap trending coin is not rounded to 0', () => {
+  const prices = Array.from({ length: 80 }, (_, i) => 0.0000045 * (1 + i * 0.01));
+  const macd = calculateMACD(prices);
+  assert.ok(macd.macd > 0, JSON.stringify(macd));
+  assert.ok(macd.signal > 0, JSON.stringify(macd));
+});
+
+test('VWAP of a cheap coin is not rounded to 0', () => {
+  const candles = candles_(wave(0.0000045, 20));
+  assert.ok(calculateVWAP(candles) > 0);
+});
+
+test('support and resistance of a cheap coin still produce distinct levels', () => {
+  const closes = wave(0.0063, 60);
+  const sr = calculateSupportResistance(closes.map((c) => ({ high: c * 1.02, low: c * 0.98, close: c })));
+  const last = closes[closes.length - 1];
+  assert.ok(sr.support.length + sr.resistance.length > 0, JSON.stringify(sr));
+  // every level sits near the price, not on a coarse 2-decimal grid (0.01 for a $0.0063 coin)
+  for (const v of [...sr.support, ...sr.resistance]) assert.ok(Math.abs(v - last) / last < 0.25, `level ${v} vs price ${last}`);
+  assert.equal(new Set([...sr.support, ...sr.resistance]).size, sr.support.length + sr.resistance.length);
+});
+
+function candles_(closes: number[]): OHLCVData[] {
+  return closes.map((c, i) => ({ timestamp: String(i), open: c, high: c * 1.01, low: c * 0.99, close: c, volume: 1000 + i }) as OHLCVData);
+}

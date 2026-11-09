@@ -62,6 +62,20 @@ export function calculateSMA(prices: number[], period: number): number {
   return slice.reduce((a, b) => a + b, 0) / period;
 }
 
+/**
+ * Round to a precision the value's size can support. A flat toFixed(2) stored a $0.0000045 coin's
+ * Bollinger bands as 0 / 0, and 2-decimal bands are meaningless below about $0.5. Values of 1 and
+ * above keep `minDecimals`, so BTC and other large assets are stored exactly as before; smaller
+ * values keep 4 significant digits (capped at 12 decimals).
+ */
+export function roundToScale(value: number, minDecimals: number = 2): number {
+  if (!Number.isFinite(value) || value === 0) return 0;
+  const abs = Math.abs(value);
+  if (abs >= 1) return parseFloat(value.toFixed(minDecimals));
+  const decimals = Math.min(12, Math.max(minDecimals, -Math.floor(Math.log10(abs)) + 3));
+  return parseFloat(value.toFixed(decimals));
+}
+
 export function calculateMACD(prices: number[]) {
   const ema12 = calculateEMA(prices, 12);
   const ema26 = calculateEMA(prices, 26);
@@ -80,9 +94,9 @@ export function calculateMACD(prices: number[]) {
   const histogram = macdLine - signalLine;
 
   return {
-    macd: parseFloat(macdLine.toFixed(4)),
-    signal: parseFloat(signalLine.toFixed(4)),
-    histogram: parseFloat(histogram.toFixed(4))
+    macd: roundToScale(macdLine, 4),
+    signal: roundToScale(signalLine, 4),
+    histogram: roundToScale(histogram, 4)
   };
 }
 
@@ -94,9 +108,9 @@ export function calculateBollingerBands(prices: number[], period: number = 20, s
   const standardDeviation = Math.sqrt(variance);
 
   return {
-    upper: parseFloat((sma + (standardDeviation * stdDev)).toFixed(2)),
-    middle: parseFloat(sma.toFixed(2)),
-    lower: parseFloat((sma - (standardDeviation * stdDev)).toFixed(2))
+    upper: roundToScale(sma + (standardDeviation * stdDev)),
+    middle: roundToScale(sma),
+    lower: roundToScale(sma - (standardDeviation * stdDev))
   };
 }
 
@@ -409,7 +423,7 @@ export function calculateVWAP(data: OHLCVData[]): number {
     cumulativeVolume += candle.volume;
   }
 
-  return cumulativeVolume === 0 ? 0 : parseFloat((cumulativeTPV / cumulativeVolume).toFixed(2));
+  return cumulativeVolume === 0 ? 0 : roundToScale(cumulativeTPV / cumulativeVolume);
 }
 
 export function analyzeVolumeTrend(data: OHLCVData[]): string {
@@ -777,13 +791,13 @@ export function calculateSupportResistance(candles: { high: number; low: number;
     coreResistance.push(minL + range * 0.618);
   }
 
-  // Deduplicate and round to 2 decimal places, filtered by position
-  const support = [...new Set(coreSupport.map(v => parseFloat(v.toFixed(2))))]
+  // Deduplicate and round to the price's scale (cents from $1 up), filtered by position
+  const support = [...new Set(coreSupport.map(v => roundToScale(v)))]
     .filter(v => v < currentClose && v > 0)
     .sort((a, b) => b - a)
     .slice(0, 3);
 
-  const resistance = [...new Set(coreResistance.map(v => parseFloat(v.toFixed(2))))]
+  const resistance = [...new Set(coreResistance.map(v => roundToScale(v)))]
     .filter(v => v > currentClose)
     .sort((a, b) => a - b)
     .slice(0, 3);
