@@ -1,9 +1,11 @@
 /**
  * Opportunity Performance Checker
  *
- * Runs daily at midnight UTC via GitHub Actions.
- * Checks ALL pending opportunity_performance rows (both 'live' from the scanner
- * and 'backtest' near-present rows) against current Binance prices.
+ * Dispatched about every 20 minutes by pg_cron (see performance-check.yml).
+ * Checks ALL pending opportunity_performance rows:
+ *  - 'live' rows (from the scanner) are replayed against closed 1-minute candles, in order, and a
+ *    take-profit or stop only counts once the entry price has traded (scripts/lib/opportunity-eval.mjs).
+ *  - 'backtest' near-present rows keep the original spot-price check against current Binance prices.
  *
  * Unlike run-performance-check.mjs (which is plan-scoped), this checker
  * is not tied to user-created plans — it tracks every AI-generated opportunity.
@@ -14,6 +16,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
+import { evaluateOpportunity } from "./lib/opportunity-eval.mjs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -59,6 +62,101 @@ function checkTpLevels(tpLevels, currentPrice, isLong) {
   return highestHit;
 }
 
+
+// ── Live rows: candle replay ────────────────────────────────────────────────
+
+const KLINE_PAGE = 1000;
+const MAX_KLINE_PAGES = 60; // ~41 days of 1m candles per asset per run; the rest resumes next run
+const MINUTE_MS = 60_000;
+
+async function fetchKlinePage(symbol, startMs) {
+  const path = `/api/v3/klines?symbol=${symbol}&interval=1m&startTime=${startMs}&limit=${KLINE_PAGE}`;
+  let lastError;
+  for (const host of ["https://api.binance.com", "https://api.binance.us"]) {
+    try {
+      const res = await fetch(`${host}${path}`);
+      if (!res.ok) throw new Error(`${host} klines ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Closed 1m candles from startMs up to (not including) endMs. If a later page fails the candles
+ * fetched so far are returned: they are contiguous, so scanned_through simply stops earlier and the
+ * next run resumes there. A failure on the first page throws, and the asset is skipped this run.
+ */
+async function fetchCandles(asset, startMs, endMs) {
+  const symbol = `${asset}USDT`;
+  const candles = [];
+  let cursor = startMs;
+  for (let page = 0; page < MAX_KLINE_PAGES; page++) {
+    let rows;
+    try {
+      rows = await fetchKlinePage(symbol, cursor);
+    } catch (err) {
+      if (page === 0) throw err;
+      console.warn(`[opp-perf] ${asset}: kline page ${page + 1} failed (${err.message}); resuming next run`);
+      break;
+    }
+    if (!rows.length) break;
+    for (const k of rows) {
+      if (k[6] >= endMs) return candles; // still-open candle
+      candles.push({ openTime: k[0], closeTime: k[6], high: parseFloat(k[2]), low: parseFloat(k[3]) });
+    }
+    cursor = rows[rows.length - 1][6] + 1;
+    if (rows.length < KLINE_PAGE) break;
+  }
+  return candles;
+}
+
+function rowStartMs(row) {
+  return row.scanned_through
+    ? Date.parse(row.scanned_through)
+    : Math.ceil(Date.parse(row.created_at) / MINUTE_MS) * MINUTE_MS;
+}
+
+async function checkLiveRows(supabase, rows) {
+  const nowMs = Date.now();
+  const byAsset = new Map();
+  for (const r of rows) byAsset.set(r.asset_symbol, [...(byAsset.get(r.asset_symbol) ?? []), r]);
+
+  let updated = 0;
+  for (const [asset, assetRows] of byAsset) {
+    let candles;
+    try {
+      const startMs = Math.min(...assetRows.map(rowStartMs));
+      candles = await fetchCandles(asset, startMs, nowMs);
+    } catch (err) {
+      console.warn(`[opp-perf] ${asset}: could not fetch candles (${err.message}); skipping, nothing is lost`);
+      continue;
+    }
+
+    for (const record of assetRows) {
+      const from = rowStartMs(record);
+      const { patch, changed } = evaluateOpportunity(record, candles.filter((c) => c.openTime >= from), nowMs);
+      const stamp = new Date().toISOString();
+      const { error } = await supabase
+        .from("opportunity_performance")
+        .update(changed ? { ...patch, last_checked_at: stamp, updated_at: stamp } : { last_checked_at: stamp })
+        .eq("id", record.id);
+      if (error) {
+        console.warn(`[opp-perf] Failed to update ${record.id}:`, error.message);
+        continue;
+      }
+      if (changed && patch.final_status !== "pending") {
+        updated++;
+        console.log(`[opp-perf] ${record.asset_symbol} ${record.bias.toUpperCase()} (live) → ${patch.final_status}${patch.entry_filled === false ? " (never filled)" : ""}`);
+      }
+      await sleep(50);
+    }
+  }
+  console.log(`[opp-perf] Live check done. Resolved ${updated}/${rows.length} records.`);
+}
+
 async function main() {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
@@ -82,8 +180,17 @@ async function main() {
     return;
   }
 
-  console.log(`[opp-perf] Checking ${pending.length} pending records...`);
+  const liveRows = pending.filter((r) => r.source === "live");
+  const spotRows = pending.filter((r) => r.source !== "live");
+  console.log(`[opp-perf] Checking ${pending.length} pending records (${liveRows.length} live, ${spotRows.length} spot-checked)...`);
 
+  if (liveRows.length > 0) await checkLiveRows(supabase, liveRows);
+  if (spotRows.length > 0) await checkSpotRows(supabase, spotRows);
+  console.log("[opp-perf] Done.");
+}
+
+/** Original spot-price check, kept for backtest rows. */
+async function checkSpotRows(supabase, pending) {
   // Fetch current price once per unique asset
   const assets = [...new Set(pending.map((r) => r.asset_symbol))];
   const prices = {};
@@ -196,7 +303,7 @@ async function main() {
     await sleep(50); // gentle rate limiting on DB writes
   }
 
-  console.log(`[opp-perf] Done. Updated ${updated}/${pending.length} records.`);
+  console.log(`[opp-perf] Spot check done. Updated ${updated}/${pending.length} records.`);
 }
 
 main().catch((err) => {
