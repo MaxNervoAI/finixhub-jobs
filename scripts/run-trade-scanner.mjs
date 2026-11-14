@@ -386,6 +386,10 @@ function getRuleBasedTopBias(indicators, insights, currentPrice) {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+// Market price at generation per asset. Stored on opportunity_performance.spot_at_generation;
+// price_at_generation holds the signal's entry price, not the market price.
+const spotByAsset = new Map();
+
 async function processAsset(supabase, asset) {
   console.log(`[${asset}] Processing...`);
 
@@ -394,6 +398,8 @@ async function processAsset(supabase, asset) {
     withRetry(() => fetchMarketInsights(supabase, asset), `${asset} insights`),
     withRetry(() => fetchCurrentPrice(asset), `${asset} price`),
   ]);
+
+  spotByAsset.set(asset, currentPrice);
 
   const scenarios = await withRetry(
     () => generateScenarios(asset, indicators, insights, currentPrice),
@@ -558,6 +564,7 @@ async function main() {
       take_profit_levels: opp.take_profit_levels,
       confidence_level: opp.confidence_level,
       price_at_generation: opp.entry_price,
+      spot_at_generation: spotByAsset.get(opp.asset_symbol) ?? null,
       quality_score: opp.quality_score,
       risk_reward_ratio: opp.risk_reward_ratio,
       technical_confluence_score: opp.technical_confluence_score,
