@@ -7,26 +7,12 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
+import { fetchBinanceGlobal } from './lib/binance.mjs';
 
 // ---- Binance helper ----
 async function fetchBinance(path: string) {
-    const domains = ['api.binance.com', 'api.binance.us'];
-    let lastError: any;
-
-    for (const domain of domains) {
-        try {
-            const res = await fetch(`https://${domain}${path}`);
-            if (res.ok) return res;
-            if (res.status === 451 || res.status === 403) {
-                // Geo-blocked, try next domain
-                continue;
-            }
-            return res;
-        } catch (err) {
-            lastError = err;
-        }
-    }
-    throw lastError || new Error('Binance fetch failed');
+    const { res } = await fetchBinanceGlobal(path);
+    return res;
 }
 
 async function main() {

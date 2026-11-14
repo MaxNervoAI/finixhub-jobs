@@ -18,8 +18,8 @@ const STATIC_FALLBACK = {
 
 async function fetchBinanceTicker(symbol) {
     const urls = [
+        `https://data-api.binance.vision/api/v3/ticker/24hr?symbol=${symbol}`,
         `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`,
-        `https://api.binance.us/api/v3/ticker/24hr?symbol=${symbol}`,
     ];
     for (const url of urls) {
         try {
@@ -38,8 +38,8 @@ async function fetchBinanceTicker(symbol) {
 async function fetchBinanceHistoricalPrice(symbol) {
     // limit=3 → data[0] = 2 days ago close, data[1] = yesterday close, data[2] = today (may be open)
     const urls = [
+        `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}USDT&interval=1d&limit=3`,
         `https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=1d&limit=3`,
-        `https://api.binance.us/api/v3/klines?symbol=${symbol}USDT&interval=1d&limit=3`,
     ];
     for (const url of urls) {
         try {
