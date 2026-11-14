@@ -1,0 +1,48 @@
+name: Reconcile daily history
+
+# One-off, run by hand: rewrites the OHLCV columns of past asset_daily_summary rows from the final
+# UTC-day Binance candle (they were built from the rolling 24h ticker and never corrected).
+# Dry run unless "write" is set to true. Afterwards run "Recompute indicator history".
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'One asset (e.g. BTC); empty for all active assets'
+        required: false
+        default: ''
+      write:
+        description: 'Write to the database (false = dry run)'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reconcile-daily-history
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Reconcile
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SYMBOL: ${{ inputs.symbol }}
+          WRITE: ${{ inputs.write }}
+        run: |
+          ARGS=""
+          [ -n "$SYMBOL" ] && ARGS="$ARGS --symbol $SYMBOL"
+          [ "$WRITE" = "true" ] && ARGS="$ARGS --write"
+          npx tsx scripts/reconcile-daily-history.ts $ARGS
