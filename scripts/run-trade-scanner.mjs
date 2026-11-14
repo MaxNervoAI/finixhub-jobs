@@ -11,6 +11,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
+import { calculateSentimentScore, normalizeInsights } from "./lib/scanner-sentiment.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -127,14 +128,8 @@ async function fetchMarketInsights(supabase, asset) {
   if (error) console.warn(`No insights for ${asset}:`, error.message);
   if (!data?.analysis) return null;
 
-  // Extract sentiment fields from the JSONB analysis object
-  const a = data.analysis;
-  return {
-    signal:      a?.technical_analysis?.overall_signal ?? null,
-    momentum:    a?.enriched_metrics?.momentum ?? null,
-    news_impact: a?.fundamental_sentiment?.news_impact ?? null,
-    trend:       a?.price_action?.trend ?? null,
-  };
+  // Extract sentiment fields from the JSONB analysis object, mapping every writer's vocabulary
+  return normalizeInsights(data.analysis);
 }
 
 const COINGECKO_IDS = { BTC: "bitcoin", ETH: "ethereum", SOL: "solana" };
@@ -171,46 +166,6 @@ function toConfidenceLabel(val) {
   const n = parseFloat(val);
   if (isNaN(n)) return "medium";
   return n >= 0.75 ? "high" : n >= 0.5 ? "medium" : "low";
-}
-
-/**
- * Calculate sentiment alignment score (0–100) from comprehensive_insights + fear/greed.
- *
- * Sources:
- *   - insights.signal: 'buy'/'sell' from technical_analysis.overall_signal
- *   - insights.momentum: 'accelerating'/'stalling' from enriched_metrics
- *   - insights.news_impact: 'positive'/'neutral'/'negative' from fundamental_sentiment
- *   - fearGreed: integer from asset_daily_summary.fear_greed_index (0-100)
- *     Contrarian: extreme fear (≤25) = long opportunity; extreme greed (≥75) = short opportunity
- */
-function calculateSentimentScore(insights, fearGreed, bias) {
-  let score = 50;
-
-  if (insights) {
-    // Signal alignment with bias
-    if (insights.signal === "buy" && bias === "long") score += 25;
-    else if (insights.signal === "sell" && bias === "short") score += 25;
-    else if (insights.signal === "buy" && bias === "short") score -= 20;
-    else if (insights.signal === "sell" && bias === "long") score -= 20;
-
-    // Momentum bonus/penalty
-    if (insights.momentum === "accelerating") score += 10;
-    else if (insights.momentum === "stalling") score -= 5;
-
-    // News impact alignment
-    if (insights.news_impact === "positive" && bias === "long") score += 10;
-    else if (insights.news_impact === "negative" && bias === "short") score += 10;
-    else if (insights.news_impact === "negative" && bias === "long") score -= 10;
-    else if (insights.news_impact === "positive" && bias === "short") score -= 10;
-  }
-
-  // Fear & Greed contrarian signal
-  if (fearGreed != null) {
-    if (fearGreed <= 25 && bias === "long") score += 10;   // extreme fear = buy opportunity
-    else if (fearGreed >= 75 && bias === "short") score += 10; // extreme greed = short opportunity
-  }
-
-  return Math.min(100, Math.max(0, score));
 }
 
 /**
