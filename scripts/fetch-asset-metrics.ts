@@ -1,16 +1,28 @@
 /**
  * fetch-asset-metrics.ts
  *
- * Fetches 24h ticker data from Binance for all active assets
- * and updates asset_daily_summary with current prices.
+ * Keeps asset_daily_summary current from Binance's global venue.
+ *
+ *  1. Today's row is a live snapshot: open/high/low/close/volume/trade count from the rolling 24h
+ *     ticker, taker flow from the last 24 hourly candles, flagged is_complete = false.
+ *  2. Every completed UTC day in the last FINALIZE_DAYS is rewritten from its final daily candle
+ *     (is_complete = true), so a past row always describes its own UTC day.
+ *
+ * All requests go through lib/binance.mjs: global venue only, no Binance.US fallback. An asset that
+ * is not listed on the global venue is skipped and reported rather than filled with another venue's
+ * numbers.
  *
  * Usage: npx tsx scripts/fetch-asset-metrics.ts
  */
 
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import { fetchBinanceGlobal } from './lib/binance.mjs';
+import { completedDays, finalizedBar, rollingTaker, type Kline } from './lib/daily-bars';
 
 dotenv.config();
+
+const FINALIZE_DAYS = 31;
 
 interface BinanceTicker24h {
     symbol: string;
@@ -30,6 +42,11 @@ function safePercent(val: number | null | undefined): number | null {
     if (val > 10000) return 10000;
     if (val < -10000) return -10000;
     return val;
+}
+
+async function klines(symbol: string, interval: '1h' | '1d', limit: number): Promise<Kline[]> {
+    const { res } = await fetchBinanceGlobal(`/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+    return res.json();
 }
 
 async function main() {
@@ -59,30 +76,21 @@ async function main() {
         if (a.binance_symbol) symbolMap.set(a.binance_symbol, a.symbol);
     }
 
-    // 2. Fetch 24h tickers from Binance (try .com then .us)
+    // 2. Fetch 24h tickers from the global venue (throws if it is unreachable: no other venue is used)
     console.log(`  Fetching 24h tickers for ${assets.length} assets...`);
-    let allTickers: BinanceTicker24h[] = [];
+    const { res: tickerRes, host } = await fetchBinanceGlobal('/api/v3/ticker/24hr');
+    const allTickers: BinanceTicker24h[] = await tickerRes.json();
+    console.log(`  Tickers from ${host}`);
 
-    try {
-        const tickerRes = await fetch('https://api.binance.com/api/v3/ticker/24hr');
-        if (!tickerRes.ok) throw new Error(String(tickerRes.status));
-        allTickers = await tickerRes.json();
-    } catch (err: any) {
-        console.warn(`  ⚠️ api.binance.com failed (${err.message}), trying api.binance.us...`);
-        try {
-            const tickerRes = await fetch('https://api.binance.us/api/v3/ticker/24hr');
-            if (!tickerRes.ok) throw new Error(String(tickerRes.status));
-            allTickers = await tickerRes.json();
-        } catch (err2: any) {
-            throw new Error(`Both Binance APIs failed. .com:${err.message}, .us:${err2.message}`);
-        }
-    }
-
-    // 3. Filter to our assets
+    // 3. Filter to our assets; report the ones the global venue does not list
     const relevantTickers = allTickers.filter(t => symbolMap.has(t.symbol));
-    console.log(`  Found ${relevantTickers.length} matching tickers\n`);
+    const listed = new Set(relevantTickers.map(t => t.symbol));
+    const unlisted = [...symbolMap.entries()].filter(([binance]) => !listed.has(binance)).map(([, ours]) => ours);
+    console.log(`  Found ${relevantTickers.length} matching tickers`);
+    if (unlisted.length) console.warn(`  ⚠️ Not listed on the global venue, skipped: ${unlisted.join(', ')}`);
+    console.log('');
 
-    // 4. Upsert to asset_daily_summary
+    // 4. Upsert today's live snapshot (is_complete = false until the day closes)
     const records = relevantTickers.map(t => {
         const symbol = symbolMap.get(t.symbol)!;
         return {
@@ -97,10 +105,10 @@ async function main() {
             change_percent_24h: safePercent(parseFloat(t.priceChangePercent)),
             trade_count: t.count,
             data_source: 'binance',
+            is_complete: false,
         };
     });
 
-    // Upsert in batches
     const batchSize = 50;
     let upsertedCount = 0;
     for (let i = 0; i < records.length; i += batchSize) {
@@ -112,64 +120,53 @@ async function main() {
         if (error) console.error(`  Upsert error batch ${Math.floor(i / batchSize) + 1}:`, error.message);
         else upsertedCount += batch.length;
     }
+    console.log(`✅ Upserted ${upsertedCount}/${records.length} live snapshots`);
 
-    const duration = Date.now() - startTime;
-    console.log(`✅ Upserted ${upsertedCount}/${records.length} ticker metrics in ${duration}ms`);
-
-    // 5. Fetch Taker Buy Volume from Binance klines (1d)
-    // The /ticker/24hr endpoint doesn't include taker data.
-    // Kline response index 9 = "Taker buy base asset volume"
-    console.log(`\n  Fetching taker buy/sell volume for ${relevantTickers.length} assets...`);
+    // 5. Taker flow for today's snapshot: the last 24 hourly candles, the window closest to the
+    //    rolling 24h ticker above (the ticker has no taker data).
+    console.log(`\n  Fetching taker flow for ${relevantTickers.length} assets...`);
     let takerUpdated = 0;
-
-    // Process in sequential batches to avoid rate limiting
     for (const ticker of relevantTickers) {
         const ourSymbol = symbolMap.get(ticker.symbol)!;
         try {
-            let klineData: any[];
-            try {
-                const klineRes = await fetch(
-                    `https://api.binance.com/api/v3/klines?symbol=${ticker.symbol}&interval=1d&limit=1`
-                );
-                if (!klineRes.ok) throw new Error(String(klineRes.status));
-                klineData = await klineRes.json();
-            } catch {
-                const klineRes = await fetch(
-                    `https://api.binance.us/api/v3/klines?symbol=${ticker.symbol}&interval=1d&limit=1`
-                );
-                if (!klineRes.ok) continue;
-                klineData = await klineRes.json();
-            }
-
-            if (klineData && klineData.length > 0) {
-                const kline = klineData[0];
-                // Kline format: [openTime, open, high, low, close, volume, closeTime,
-                //                quoteVolume, trades, takerBuyBaseVol, takerBuyQuoteVol, ignore]
-                const totalVol = parseFloat(kline[5]);
-                const takerBuyVol = parseFloat(kline[9]);
-                const takerSellVol = totalVol - takerBuyVol;
-
-                const { error: takerError } = await supabase
-                    .from('asset_daily_summary')
-                    .update({
-                        taker_buy_volume: takerBuyVol,
-                        taker_sell_volume: takerSellVol,
-                    })
-                    .eq('symbol', ourSymbol)
-                    .eq('date', today);
-
-                if (!takerError) takerUpdated++;
-            }
-        } catch (err: any) {
-            // Skip silently — taker data is supplementary
+            const taker = rollingTaker(await klines(ticker.symbol, '1h', 24));
+            const { error: takerError } = await supabase
+                .from('asset_daily_summary')
+                .update(taker)
+                .eq('symbol', ourSymbol)
+                .eq('date', today);
+            if (!takerError) takerUpdated++;
+        } catch {
+            // Taker data is supplementary; the next run retries
         }
+        await new Promise(r => setTimeout(r, 50)); // 1200 req/min limit
+    }
+    console.log(`✅ Taker flow updated for ${takerUpdated}/${relevantTickers.length} assets`);
 
-        // Small delay to respect rate limits (1200 req/min)
+    // 6. Finalize completed days from their final daily candle (also fills days that have no row yet)
+    console.log(`\n  Finalizing the last ${FINALIZE_DAYS} completed days...`);
+    let finalizedRows = 0;
+    let finalizeFailed = 0;
+    const now = Date.now();
+    for (const ticker of relevantTickers) {
+        const ourSymbol = symbolMap.get(ticker.symbol)!;
+        try {
+            const bars = completedDays(await klines(ticker.symbol, '1d', FINALIZE_DAYS + 1), now).map(finalizedBar);
+            if (bars.length === 0) continue;
+            const { error } = await supabase
+                .from('asset_daily_summary')
+                .upsert(bars.map(b => ({ symbol: ourSymbol, ...b, data_source: 'binance' })), { onConflict: 'symbol,date', ignoreDuplicates: false });
+            if (error) { finalizeFailed++; console.error(`  Finalize error ${ourSymbol}: ${error.message}`); }
+            else finalizedRows += bars.length;
+        } catch (err: any) {
+            finalizeFailed++;
+            if (finalizeFailed <= 3) console.error(`  Finalize failed ${ourSymbol}: ${err?.message}`);
+        }
         await new Promise(r => setTimeout(r, 50));
     }
+    console.log(`✅ Finalized ${finalizedRows} rows (${finalizeFailed} assets failed)`);
 
-    const totalDuration = Date.now() - startTime;
-    console.log(`✅ Done! Taker volume updated for ${takerUpdated}/${relevantTickers.length} assets. Total: ${totalDuration}ms\n`);
+    console.log(`\nDone in ${Date.now() - startTime}ms\n`);
 }
 
 main().then(() => process.exit(0)).catch(err => { console.error('💥 Fatal:', err); process.exit(1); });

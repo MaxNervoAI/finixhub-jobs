@@ -17,6 +17,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { evaluateOpportunity } from "./lib/opportunity-eval.mjs";
+import { fetchBinanceGlobal } from "./lib/binance.mjs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -70,18 +71,8 @@ const MAX_KLINE_PAGES = 60; // ~41 days of 1m candles per asset per run; the res
 const MINUTE_MS = 60_000;
 
 async function fetchKlinePage(symbol, startMs) {
-  const path = `/api/v3/klines?symbol=${symbol}&interval=1m&startTime=${startMs}&limit=${KLINE_PAGE}`;
-  let lastError;
-  for (const host of ["https://api.binance.com", "https://api.binance.us"]) {
-    try {
-      const res = await fetch(`${host}${path}`);
-      if (!res.ok) throw new Error(`${host} klines ${res.status}`);
-      return await res.json();
-    } catch (err) {
-      lastError = err;
-    }
-  }
-  throw lastError;
+  const { res } = await fetchBinanceGlobal(`/api/v3/klines?symbol=${symbol}&interval=1m&startTime=${startMs}&limit=${KLINE_PAGE}`);
+  return res.json();
 }
 
 /**
